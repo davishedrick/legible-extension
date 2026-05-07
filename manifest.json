@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Author Companion",
+  "version": "0.1.3",
+  "description": "A lightweight Google Docs companion that starts Author Companion sessions when writing begins.",
+  "permissions": ["storage", "identity"],
+  "host_permissions": [
+    "https://davishedrick.pythonanywhere.com/*",
+    "https://docs.googleapis.com/*",
+    "http://localhost:8000/*"
+  ],
+  "oauth2": {
+    "client_id": "4578986662-i6h7q3hsrrjv3rhqakm8ocia5kmfbpph.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/documents.readonly"
+    ]
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://docs.google.com/document/*"],
+      "js": ["content.js"],
+      "css": ["style.css"],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ]
+}

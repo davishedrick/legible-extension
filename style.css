@@ -1,0 +1,174 @@
+#ace-widget {
+  position: fixed;
+  z-index: 2147483647;
+  box-sizing: border-box;
+  max-width: 230px;
+  padding: 9px 10px;
+  border: 1px solid rgba(33, 40, 49, 0.14);
+  border-radius: 12px;
+  background: rgba(255, 252, 246, 0.96);
+  box-shadow: 0 10px 30px rgba(27, 31, 36, 0.12);
+  color: #24201b;
+  cursor: grab;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: 13px;
+  line-height: 1.25;
+  touch-action: none;
+  user-select: none;
+}
+
+#ace-widget,
+#ace-widget * {
+  box-sizing: border-box;
+}
+
+#ace-widget.ace-widget--dragging {
+  cursor: grabbing;
+}
+
+.ace-widget--idle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 68px;
+}
+
+.ace-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #b8a98d;
+}
+
+.ace-widget--detecting .ace-status-dot {
+  background: #5f8f64;
+}
+
+.ace-prompt-copy,
+.ace-completed-copy,
+.ace-project-copy,
+.ace-sync-copy,
+.ace-empty {
+  margin-bottom: 7px;
+  color: #3a332b;
+}
+
+.ace-project-copy,
+.ace-sync-copy,
+.ace-empty {
+  color: #6a5c4b;
+  font-size: 12px;
+}
+
+.ace-sync-copy--pending {
+  color: #8a4b21;
+}
+
+.ace-sync-copy--synced {
+  color: #3f6f46;
+}
+
+.ace-session-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 7px;
+  white-space: nowrap;
+}
+
+.ace-session-type {
+  font-weight: 700;
+}
+
+.ace-time {
+  color: #5f5548;
+  font-variant-numeric: tabular-nums;
+}
+
+.ace-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+
+.ace-project-list {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 8px;
+  max-height: 180px;
+  overflow: auto;
+}
+
+.ace-project-option {
+  appearance: none;
+  border: 1px solid rgba(33, 40, 49, 0.12);
+  border-radius: 10px;
+  background: #fff8ed;
+  color: #3a332b;
+  cursor: pointer;
+  display: grid;
+  gap: 2px;
+  font: inherit;
+  padding: 7px 8px;
+  text-align: left;
+}
+
+.ace-project-option:hover,
+.ace-project-option:focus-visible {
+  background: #eee4d5;
+  outline: none;
+}
+
+.ace-project-option small {
+  color: #766957;
+  font-size: 11px;
+}
+
+.ace-button {
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  background: #eee4d5;
+  color: #3a332b;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  padding: 6px 9px;
+}
+
+.ace-button:hover,
+.ace-button:focus-visible {
+  background: #e1d2bd;
+  outline: none;
+}
+
+.ace-button--primary,
+.ace-button--end {
+  background: #2e2a24;
+  color: #fffaf0;
+}
+
+.ace-button--primary:hover,
+.ace-button--primary:focus-visible,
+.ace-button--end:hover,
+.ace-button--end:focus-visible {
+  background: #4a4035;
+}
+
+.ace-button--switch {
+  background: transparent;
+  color: #6a5c4b;
+  padding-left: 2px;
+  padding-right: 2px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.ace-button--switch:hover,
+.ace-button--switch:focus-visible {
+  background: transparent;
+  color: #2e2a24;
+}
