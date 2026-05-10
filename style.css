@@ -26,22 +26,127 @@
   cursor: grabbing;
 }
 
+#ace-widget.ace-widget--issue-form,
+#ace-widget.ace-widget--issues {
+  width: 270px;
+  max-width: min(270px, calc(100vw - 36px));
+}
+
+#ace-widget:not(.ace-widget--idle) {
+  position: fixed;
+  padding-top: 20px;
+}
+
+.ace-close-button {
+  appearance: none;
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  width: 18px;
+  height: 18px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #766957;
+  cursor: pointer;
+  display: grid;
+  font: inherit;
+  font-size: 15px;
+  line-height: 1;
+  place-items: center;
+  padding: 0;
+}
+
+.ace-close-button:hover,
+.ace-close-button:focus-visible {
+  background: #eee4d5;
+  color: #2e2a24;
+  outline: none;
+}
+
 .ace-widget--idle {
+  width: 38px;
+  height: 38px;
+  min-width: 38px;
+  padding: 0;
+  border-radius: 999px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ace-icon-button {
+  appearance: none;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  border-radius: inherit;
+  background: transparent;
+  color: #2e2a24;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  position: relative;
+}
+
+.ace-icon-button:hover,
+.ace-icon-button:focus-visible {
+  background: #eee4d5;
+  outline: none;
+}
+
+.ace-pencil-icon {
+  width: 20px;
+  height: 20px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.ace-icon-button::after {
+  content: "";
+  position: absolute;
+  width: 8px;
+  height: 8px;
+  right: 6px;
+  bottom: 6px;
+  border-radius: 999px;
+  background: #5f8f64;
+  border: 1px solid rgba(255, 252, 246, 0.96);
+}
+
+.ace-loading-line {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  min-width: 68px;
+  gap: 8px;
+  color: #3a332b;
+  font-weight: 700;
+  margin-bottom: 5px;
 }
 
-.ace-status-dot {
-  width: 7px;
-  height: 7px;
+.ace-loading-detail {
+  color: #6a5c4b;
+  font-size: 12px;
+}
+
+.ace-spinner {
+  width: 13px;
+  height: 13px;
+  border: 2px solid rgba(58, 51, 43, 0.22);
+  border-top-color: #3f6f46;
   border-radius: 999px;
-  background: #b8a98d;
+  flex: 0 0 auto;
+  animation: ace-spin 0.75s linear infinite;
 }
 
-.ace-widget--detecting .ace-status-dot {
-  background: #5f8f64;
+@keyframes ace-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .ace-prompt-copy,
@@ -124,6 +229,71 @@
 .ace-project-option small {
   color: #766957;
   font-size: 11px;
+}
+
+.ace-field {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.ace-field span,
+.ace-issue-meta {
+  color: #6a5c4b;
+  font-size: 11px;
+}
+
+.ace-field textarea {
+  appearance: none;
+  min-height: 58px;
+  resize: vertical;
+  border: 1px solid rgba(33, 40, 49, 0.14);
+  border-radius: 8px;
+  background: #fffaf0;
+  color: #24201b;
+  font: inherit;
+  line-height: 1.3;
+  padding: 7px;
+  user-select: text;
+}
+
+.ace-field textarea:focus-visible {
+  border-color: #5f8f64;
+  outline: 2px solid rgba(95, 143, 100, 0.2);
+}
+
+.ace-preview {
+  min-height: 16px;
+  margin-bottom: 8px;
+  color: #6a5c4b;
+  font-size: 11px;
+}
+
+.ace-issue-list {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.ace-issue-row {
+  border-top: 1px solid rgba(33, 40, 49, 0.1);
+  display: grid;
+  gap: 4px;
+  padding-top: 8px;
+}
+
+.ace-issue-title {
+  color: #2e2a24;
+  font-weight: 700;
+}
+
+.ace-issue-row blockquote {
+  border-left: 2px solid #d6c6ae;
+  color: #5f5548;
+  margin: 2px 0;
+  padding-left: 7px;
 }
 
 .ace-button {

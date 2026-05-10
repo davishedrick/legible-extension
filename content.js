@@ -4,16 +4,16 @@
   const ACE_API_BASE_URL = "https://davishedrick.pythonanywhere.com";
   const ACE_APP_URL = ACE_API_BASE_URL;
   const ACE_WIDGET_ID = "ace-widget";
-  const ACE_START_DELAY_MS = 4000;
-  const ACE_ACTIVITY_GAP_MS = 1500;
   const ACE_TIMER_INTERVAL_MS = 1000;
-  const ACE_GOOGLE_DOC_SETTLE_DELAY_MS = 1200;
-  const ACE_GOOGLE_DOC_POLL_DELAY_MS = 1000;
-  const ACE_GOOGLE_DOC_POLL_ATTEMPTS = 5;
+  const ACE_GOOGLE_DOC_SETTLE_DELAY_MS = 500;
+  const ACE_GOOGLE_DOC_POLL_DELAY_MS = 700;
+  const ACE_GOOGLE_DOC_POLL_ATTEMPTS = 6;
   const ACE_ACTIVITY_MESSAGE = "ace-writing-activity";
+  const ACE_GOOGLE_DOC_WORD_COUNT_MESSAGE = "ace-google-doc-word-count";
   const ACE_GOOGLE_DOC_START_SNAPSHOT_MESSAGE = "ace-google-doc-start-snapshot";
   const ACE_GOOGLE_DOC_DIFF_MESSAGE = "ace-google-doc-diff";
   const ACE_IS_TOP_FRAME = window.top === window;
+  const ACE_ISSUE_TITLE_WORD_LIMIT = 8;
 
   const ACE_SESSION_STORAGE = {
     widgetPosition: "ace-widget-position"
@@ -21,7 +21,9 @@
 
   const ACE_LOCAL_STORAGE = {
     activeSession: "aceActiveSession",
-    pendingSessions: "acePendingSessions"
+    pendingSessions: "acePendingSessions",
+    documentBindings: "aceDocumentBindings",
+    documentBaselines: "aceDocumentBaselines"
   };
 
   const ACE_DEFAULT_POSITION = "middle-right";
@@ -66,12 +68,53 @@
     "F12"
   ]);
 
+  const ACE_ISSUE_SECTION_NUMBER_WORDS = {
+    zero: 0,
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10,
+    eleven: 11,
+    twelve: 12,
+    thirteen: 13,
+    fourteen: 14,
+    fifteen: 15,
+    sixteen: 16,
+    seventeen: 17,
+    eighteen: 18,
+    nineteen: 19,
+    twenty: 20,
+    thirty: 30,
+    forty: 40,
+    fifty: 50,
+    sixty: 60,
+    seventy: 70,
+    eighty: 80,
+    ninety: 90
+  };
+  const ACE_ISSUE_SECTION_REGEX = new RegExp(
+    "(chapter|scene|section)\\s+(?:\\d+|(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)(?:[-\\s](?:one|two|three|four|five|six|seven|eight|nine))?)\\b",
+    "i"
+  );
+  const ACE_ISSUE_TYPE_RULES = [
+    { type: "Dialogue", keywords: ["dialogue", "conversation", "line"] },
+    { type: "Pacing", keywords: ["slow", "fast", "drag", "rush"] },
+    { type: "Clarity", keywords: ["confusing", "unclear", "hard to follow"] },
+    { type: "Character", keywords: ["motivation", "arc", "character"] },
+    { type: "Grammar", keywords: ["grammar", "typo", "spelling"] }
+  ];
+  const ACE_ISSUE_HIGH_PRIORITY_KEYWORDS = ["major", "critical", "big"];
+
   let aceState = "idle";
   let aceActiveSession = null;
   let aceCompletedSession = null;
   let aceTimerId = null;
-  let aceStartTimerId = null;
-  let aceActivityGapTimerId = null;
   let aceProjects = [];
   let aceSelectedProject = null;
   let aceProjectPickerMode = "completed";
@@ -80,7 +123,15 @@
   let aceWidget = null;
   let aceWidgetPosition = sessionStorage.getItem(ACE_SESSION_STORAGE.widgetPosition) || ACE_DEFAULT_POSITION;
   let aceDragState = null;
+  let aceLastPointerActionAt = 0;
   let acePromptError = "";
+  let aceExitHandled = false;
+  let aceAutoSyncRestoreId = "";
+  let aceCatchUpCandidate = null;
+  let aceIssueDraft = null;
+  let aceIssueReturnState = "idle";
+  let aceCurrentIssues = [];
+  let aceIssueStatus = "";
 
   if (ACE_IS_TOP_FRAME) {
     if (document.getElementById(ACE_WIDGET_ID)) {
@@ -163,6 +214,10 @@
     return Boolean(runtime?.runtime?.id && runtime?.runtime?.sendMessage);
   }
 
+  function aceClosest(target, selector) {
+    return target?.closest ? target.closest(selector) : null;
+  }
+
   function aceCapitalize(value) {
     return value.charAt(0).toUpperCase() + value.slice(1);
   }
@@ -179,6 +234,78 @@
   function aceCreateExtensionSessionId(documentId) {
     const random = Math.random().toString(36).slice(2, 10);
     return `ace-${documentId || "doc"}-${Date.now()}-${random}`;
+  }
+
+  function aceCreateExtensionIssueId(documentId) {
+    const random = Math.random().toString(36).slice(2, 10);
+    return `ace-issue-${documentId || "doc"}-${Date.now()}-${random}`;
+  }
+
+  function aceNormalizeIssueNoteText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function aceNormalizeIssueComparisonText(value) {
+    return String(value || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }
+
+  function aceParseIssueSectionNumber(value) {
+    const normalizedValue = aceNormalizeIssueNoteText(value);
+    if (/^\d+$/.test(normalizedValue)) {
+      return normalizedValue;
+    }
+
+    const wordTokens = aceNormalizeIssueComparisonText(normalizedValue)
+      .split(" ")
+      .filter(Boolean);
+    if (!wordTokens.length) {
+      return normalizedValue;
+    }
+    if (!wordTokens.every(function (token) {
+      return Object.prototype.hasOwnProperty.call(ACE_ISSUE_SECTION_NUMBER_WORDS, token);
+    })) {
+      return normalizedValue;
+    }
+    return String(wordTokens.reduce(function (total, token) {
+      return total + ACE_ISSUE_SECTION_NUMBER_WORDS[token];
+    }, 0));
+  }
+
+  function aceFormatDerivedIssueSection(match) {
+    const normalizedMatch = aceNormalizeIssueNoteText(match);
+    const sectionParts = normalizedMatch.match(/^(chapter|scene|section)\s+(.+)$/i);
+    if (!sectionParts) {
+      return normalizedMatch || "Unassigned";
+    }
+    const sectionType = aceCapitalize(sectionParts[1].toLowerCase());
+    return `${sectionType} ${aceParseIssueSectionNumber(sectionParts[2])}`;
+  }
+
+  function aceDeriveIssueFieldsFromNote(note) {
+    const normalizedNote = aceNormalizeIssueNoteText(note);
+    const words = normalizedNote.split(" ").filter(Boolean);
+    const matchedSection = String(note || "").match(ACE_ISSUE_SECTION_REGEX);
+    const normalizedLower = normalizedNote.toLowerCase();
+    const matchedType = ACE_ISSUE_TYPE_RULES.find(function (rule) {
+      return rule.keywords.some(function (keyword) {
+        return normalizedLower.includes(keyword);
+      });
+    });
+    return {
+      title: words.length
+        ? words.slice(0, Math.min(ACE_ISSUE_TITLE_WORD_LIMIT, words.length)).join(" ")
+        : "Untitled issue",
+      sectionLabel: matchedSection?.[0]
+        ? aceFormatDerivedIssueSection(matchedSection[0])
+        : "Unassigned",
+      type: matchedType?.type || "General",
+      priority: ACE_ISSUE_HIGH_PRIORITY_KEYWORDS.some(function (keyword) {
+        return normalizedLower.includes(keyword);
+      }) ? "High" : "Medium"
+    };
   }
 
   function aceElapsedMs() {
@@ -260,12 +387,6 @@
     return response.payload || {};
   }
 
-  async function aceGetBinding(documentId) {
-    return aceApiFetch(
-      `/api/extension/document-binding?documentId=${encodeURIComponent(documentId)}`
-    );
-  }
-
   async function aceGetProjects() {
     const payload = await aceApiFetch("/api/projects");
     return Array.isArray(payload.projects) ? payload.projects : [];
@@ -278,6 +399,82 @@
     });
   }
 
+  async function aceLocalDocumentBindings() {
+    const stored = await aceStorageGet(ACE_LOCAL_STORAGE.documentBindings);
+    const bindings = stored[ACE_LOCAL_STORAGE.documentBindings];
+    return bindings && typeof bindings === "object" && !Array.isArray(bindings)
+      ? bindings
+      : {};
+  }
+
+  async function aceGetLocalDocumentBinding(documentId) {
+    if (!documentId) {
+      return null;
+    }
+
+    const bindings = await aceLocalDocumentBindings();
+    return bindings[documentId] || null;
+  }
+
+  async function aceSaveLocalDocumentBinding(documentId, project) {
+    if (!documentId || !project?.id) {
+      return;
+    }
+
+    const bindings = await aceLocalDocumentBindings();
+    await aceStorageSet({
+      [ACE_LOCAL_STORAGE.documentBindings]: {
+        ...bindings,
+        [documentId]: {
+          projectId: project.id,
+          project,
+          updatedAt: new Date().toISOString()
+        }
+      }
+    });
+  }
+
+  async function aceLocalDocumentBaselines() {
+    const stored = await aceStorageGet(ACE_LOCAL_STORAGE.documentBaselines);
+    const baselines = stored[ACE_LOCAL_STORAGE.documentBaselines];
+    return baselines && typeof baselines === "object" && !Array.isArray(baselines)
+      ? baselines
+      : {};
+  }
+
+  async function aceGetDocumentBaseline(documentId) {
+    if (!documentId) {
+      return null;
+    }
+
+    const baselines = await aceLocalDocumentBaselines();
+    return baselines[documentId] || null;
+  }
+
+  async function aceSaveDocumentBaseline(session, project) {
+    const documentId = String(session?.documentId || "").trim();
+    const projectId = String(session?.projectId || project?.id || "").trim();
+    const endWordCount = Number(session?.endDocumentWordCount);
+    if (!documentId || !projectId || !Number.isFinite(endWordCount)) {
+      return;
+    }
+
+    const baselines = await aceLocalDocumentBaselines();
+    await aceStorageSet({
+      [ACE_LOCAL_STORAGE.documentBaselines]: {
+        ...baselines,
+        [documentId]: {
+          documentId,
+          projectId,
+          project: project || null,
+          endDocumentWordCount: Math.max(0, endWordCount),
+          syncedAt: new Date().toISOString(),
+          sessionId: session.extensionSessionId || ""
+        }
+      }
+    });
+  }
+
   async function acePostSession(session) {
     const payload = aceSessionSyncPayload(session);
     console.info("[ACE] Syncing extension session payload", payload);
@@ -285,6 +482,20 @@
       method: "POST",
       body: JSON.stringify(payload)
     });
+  }
+
+  async function acePostIssue(issue) {
+    console.info("[ACE] Syncing extension issue payload", issue);
+    return aceApiFetch("/api/extension/issues", {
+      method: "POST",
+      body: JSON.stringify(issue)
+    });
+  }
+
+  async function aceGetExtensionIssues(documentId) {
+    return aceApiFetch(
+      `/api/extension/issues?documentId=${encodeURIComponent(documentId)}`
+    );
   }
 
   function aceSessionSyncPayload(session) {
@@ -436,15 +647,43 @@
     });
   }
 
+  async function aceGoogleDocWordCount(documentId, interactive) {
+    if (!documentId) {
+      return {
+        ok: false,
+        wordCount: null,
+        error: "Google Docs document ID is missing."
+      };
+    }
+
+    return aceGoogleDocMessage(ACE_GOOGLE_DOC_WORD_COUNT_MESSAGE, {
+      documentId,
+      interactive: Boolean(interactive)
+    });
+  }
+
   function aceDelay(milliseconds) {
     return new Promise(function (resolve) {
       window.setTimeout(resolve, milliseconds);
     });
   }
 
-  async function aceGoogleDocDiffAfterSave(documentId, extensionSessionId, startWordCount) {
+  function aceNextFrame() {
+    return new Promise(function (resolve) {
+      window.requestAnimationFrame(resolve);
+    });
+  }
+
+  async function aceGoogleDocDiffAfterSave(
+    documentId,
+    extensionSessionId,
+    startWordCount,
+    startRevisionId,
+    hadDocumentActivity
+  ) {
     await aceDelay(ACE_GOOGLE_DOC_SETTLE_DELAY_MS);
 
+    const expectedRevisionChange = Boolean(hadDocumentActivity && startRevisionId);
     let bestResponse = {
       ok: false,
       wordCount: null,
@@ -475,6 +714,11 @@
         const wordsRemoved = Math.max(0, Number(response.wordsRemoved) || 0);
         const totalActivity = wordsAdded + wordsRemoved;
         const netMagnitude = Math.abs(delta);
+        const revisionChanged = Boolean(
+          startRevisionId
+          && response.revisionId
+          && response.revisionId !== startRevisionId
+        );
         const isBetterResponse = !bestResponse.ok
           || totalActivity > bestActivity
           || (totalActivity === bestActivity && netMagnitude > bestNetMagnitude);
@@ -486,9 +730,10 @@
           bestAttempt = attempt + 1;
         }
 
-        if (totalActivity > 0 || delta !== 0) {
+        if (totalActivity > 0 || delta !== 0 || revisionChanged || !expectedRevisionChange) {
           console.info("[ACE] Selected Google Docs word diff", {
             attempt: attempt + 1,
+            revisionChanged,
             startWordCount,
             endWordCount: response.wordCount,
             wordsAdded,
@@ -502,6 +747,15 @@
       if (attempt < ACE_GOOGLE_DOC_POLL_ATTEMPTS - 1) {
         await aceDelay(ACE_GOOGLE_DOC_POLL_DELAY_MS);
       }
+    }
+
+    if (expectedRevisionChange && bestResponse.ok) {
+      return {
+        ...bestResponse,
+        ok: false,
+        wordCount: null,
+        error: "Google Docs has not published the latest revision yet. Retry shortly."
+      };
     }
 
     console.info("[ACE] Selected Google Docs word diff", {
@@ -520,15 +774,7 @@
   }
 
   function aceClearActivityTimers() {
-    if (aceStartTimerId) {
-      window.clearTimeout(aceStartTimerId);
-      aceStartTimerId = null;
-    }
-
-    if (aceActivityGapTimerId) {
-      window.clearTimeout(aceActivityGapTimerId);
-      aceActivityGapTimerId = null;
-    }
+    // Writing activity no longer schedules an automatic start prompt.
   }
 
   function aceClearTimer() {
@@ -577,21 +823,31 @@
     acePromptError = "";
   }
 
-  function aceRenderMessage(message) {
-    aceWidget.className = "ace-widget ace-widget--prompt";
-    aceWidget.innerHTML = `<div class="ace-prompt-copy">${aceEscapeHtml(message)}</div>`;
+  function aceRenderLoading(message, detail) {
+    const detailCopy = detail
+      ? `<div class="ace-loading-detail">${aceEscapeHtml(detail)}</div>`
+      : "";
+    aceWidget.className = "ace-widget ace-widget--loading";
+    aceWidget.innerHTML = `
+      <div class="ace-loading-line">
+        <span class="ace-spinner" aria-hidden="true"></span>
+        <span>${aceEscapeHtml(message)}</span>
+      </div>
+      ${detailCopy}
+    `;
     aceApplyWidgetPosition();
   }
 
   function aceRenderIdle() {
     aceWidget.className = "ace-widget ace-widget--idle";
-    aceWidget.innerHTML = '<span class="ace-status-dot" aria-hidden="true"></span><span>Idle</span>';
-    aceApplyWidgetPosition();
-  }
-
-  function aceRenderDetecting() {
-    aceWidget.className = "ace-widget ace-widget--idle ace-widget--detecting";
-    aceWidget.innerHTML = '<span class="ace-status-dot" aria-hidden="true"></span><span>Listening...</span>';
+    aceWidget.innerHTML = `
+      <button class="ace-icon-button" type="button" data-ace-action="show-controls" aria-label="Open Author Companion session controls">
+        <svg class="ace-pencil-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M4 20h4.2L19.4 8.8a2.1 2.1 0 0 0 0-3L18.2 4.6a2.1 2.1 0 0 0-3 0L4 15.8V20z"></path>
+          <path d="M13.8 6 18 10.2"></path>
+        </svg>
+      </button>
+    `;
     aceApplyWidgetPosition();
   }
 
@@ -601,11 +857,33 @@
       : "";
     aceWidget.className = "ace-widget ace-widget--prompt";
     aceWidget.innerHTML = `
+      ${aceCloseButtonHtml()}
       <div class="ace-prompt-copy">Start session?</div>
       ${errorCopy}
       <div class="ace-actions">
         <button class="ace-button ace-button--primary" type="button" data-ace-action="confirm-start">Yes</button>
+        <button class="ace-button" type="button" data-ace-action="show-issue-form">Add issue</button>
+        <button class="ace-button" type="button" data-ace-action="show-issues">Issues</button>
         <button class="ace-button" type="button" data-ace-action="decline-start">No</button>
+      </div>
+    `;
+    aceApplyWidgetPosition();
+  }
+
+  function aceRenderCatchUpPrompt() {
+    const words = Math.max(0, Number(aceCatchUpCandidate?.wordsWritten) || 0);
+    const statusCopy = aceSyncStatus
+      ? `<div class="ace-sync-copy ace-sync-copy--${aceSyncStatus}">${aceEscapeHtml(aceSyncMessage)}</div>`
+      : "";
+    aceWidget.className = "ace-widget ace-widget--catch-up";
+    aceWidget.innerHTML = `
+      ${aceCloseButtonHtml()}
+      <div class="ace-prompt-copy">Looks like ${aceFormatWords(words)} were added since your last session. Add them?</div>
+      <div class="ace-project-copy">This creates a 1 min catch-up writing session.</div>
+      ${statusCopy}
+      <div class="ace-actions">
+        <button class="ace-button ace-button--primary" type="button" data-ace-action="add-catch-up">Add missed words</button>
+        <button class="ace-button" type="button" data-ace-action="skip-catch-up">Skip</button>
       </div>
     `;
     aceApplyWidgetPosition();
@@ -636,17 +914,32 @@
   }
 
   function aceRenderActive() {
+    if (!aceActiveSession) {
+      aceClearTimer();
+      if (aceCompletedSession) {
+        aceState = "completed";
+        aceRenderCompleted();
+      } else {
+        aceState = "idle";
+        aceRenderIdle();
+      }
+      return;
+    }
+
     const label = aceCapitalize(aceActiveSession?.sessionType || "writing");
     const nextType = aceActiveSession?.sessionType === "writing" ? "Editing" : "Writing";
 
     aceWidget.className = "ace-widget ace-widget--active";
     aceWidget.innerHTML = `
+      ${aceCloseButtonHtml()}
       <div class="ace-session-line">
         <span class="ace-session-type">${label}</span>
         <span class="ace-time">${aceFormatTimer(aceElapsedMs())}</span>
       </div>
       <div class="ace-actions">
         <button class="ace-button ace-button--end" type="button" data-ace-action="end">End</button>
+        <button class="ace-button" type="button" data-ace-action="show-issue-form">Add issue</button>
+        <button class="ace-button" type="button" data-ace-action="show-issues">Issues</button>
         <button class="ace-button ace-button--switch" type="button" data-ace-action="switch">Switch to ${nextType}</button>
         <button class="ace-button ace-button--switch" type="button" data-ace-action="change-project">Change project</button>
       </div>
@@ -676,6 +969,7 @@
 
     aceWidget.className = "ace-widget ace-widget--completed";
     aceWidget.innerHTML = `
+      ${aceCloseButtonHtml()}
       <div class="ace-completed-copy">${label} session tracked: ${aceFormatCompletedMinutes(aceCompletedSession?.durationMinutes || 1)}${wordsCopy}</div>
       ${projectCopy}
       ${methodCopy}
@@ -683,6 +977,8 @@
       ${statusCopy}
       <div class="ace-actions">
         <button class="ace-button" type="button" data-ace-action="open">Open app</button>
+        <button class="ace-button" type="button" data-ace-action="show-issue-form">Add issue</button>
+        <button class="ace-button" type="button" data-ace-action="show-issues">Issues</button>
         <button class="ace-button" type="button" data-ace-action="retry-sync" ${retryDisabled}>Retry sync</button>
         <button class="ace-button" type="button" data-ace-action="change-project" ${changeProjectDisabled}>Change project</button>
         ${contextInvalid ? '<button class="ace-button ace-button--primary" type="button" data-ace-action="refresh-page">Refresh doc</button>' : ""}
@@ -693,7 +989,13 @@
   }
 
   function aceRenderProjectPicker() {
-    const copy = aceProjectPickerMode === "active" ? "Change project" : "Choose project";
+    const copy = aceProjectPickerMode === "active"
+      ? "Change project"
+      : aceProjectPickerMode === "catch-up"
+        ? "Choose project for missed words"
+        : aceProjectPickerMode === "issue"
+          ? "Choose project for this issue"
+          : "Choose project";
     const rows = aceProjects.length
       ? aceProjects.map(function (project) {
           return `
@@ -707,11 +1009,106 @@
 
     aceWidget.className = "ace-widget ace-widget--picker";
     aceWidget.innerHTML = `
+      ${aceCloseButtonHtml()}
       <div class="ace-prompt-copy">${copy}</div>
       <div class="ace-project-list">${rows}</div>
       <div class="ace-actions">
         <button class="ace-button" type="button" data-ace-action="open">Open app</button>
         <button class="ace-button" type="button" data-ace-action="retry-sync">Retry</button>
+      </div>
+    `;
+    aceApplyWidgetPosition();
+  }
+
+  function aceGetSelectedText() {
+    const activeElement = document.activeElement;
+    if (
+      activeElement
+      && typeof activeElement.value === "string"
+      && typeof activeElement.selectionStart === "number"
+      && typeof activeElement.selectionEnd === "number"
+      && activeElement.selectionEnd > activeElement.selectionStart
+    ) {
+      return activeElement.value.slice(activeElement.selectionStart, activeElement.selectionEnd);
+    }
+
+    const selectedText = window.getSelection ? window.getSelection().toString() : "";
+    return aceNormalizeIssueNoteText(selectedText).slice(0, 500);
+  }
+
+  function aceIssuePreviewCopy(note) {
+    const normalizedNote = aceNormalizeIssueNoteText(note);
+    if (!normalizedNote) {
+      return "";
+    }
+
+    const derived = aceDeriveIssueFieldsFromNote(normalizedNote);
+    return `Will file under ${derived.sectionLabel} | ${derived.type} | ${derived.priority} priority.`;
+  }
+
+  function aceRenderIssueForm() {
+    const note = aceIssueDraft?.note || "";
+    const snippet = aceIssueDraft?.snippet || "";
+    const preview = aceIssuePreviewCopy(note);
+    const statusCopy = aceIssueStatus
+      ? `<div class="ace-sync-copy ace-sync-copy--pending">${aceEscapeHtml(aceShortDiagnostic(aceIssueStatus))}</div>`
+      : "";
+
+    aceWidget.className = "ace-widget ace-widget--issue-form";
+    aceWidget.innerHTML = `
+      ${aceCloseButtonHtml()}
+      <form class="ace-issue-form" data-ace-issue-form>
+        <div class="ace-prompt-copy">Add issue</div>
+        ${statusCopy}
+        <label class="ace-field">
+          <span>Quick note</span>
+          <textarea name="note" rows="3" placeholder="chapter 3 slow">${aceEscapeHtml(note)}</textarea>
+        </label>
+        <label class="ace-field">
+          <span>Quote</span>
+          <textarea name="snippet" rows="3" placeholder="Selected or pasted text">${aceEscapeHtml(snippet)}</textarea>
+        </label>
+        <div class="ace-preview" aria-live="polite">${aceEscapeHtml(preview)}</div>
+        <div class="ace-actions">
+          <button class="ace-button ace-button--primary" type="button" data-ace-action="save-issue">Save issue</button>
+          <button class="ace-button" type="button" data-ace-action="cancel-issue">Cancel</button>
+        </div>
+      </form>
+    `;
+    aceApplyWidgetPosition();
+  }
+
+  function aceRenderIssuesList(message = "") {
+    const rows = aceCurrentIssues.length
+      ? aceCurrentIssues.map(function (issue) {
+          const snippet = aceNormalizeIssueNoteText(issue.snippet || issue.quoteLocator?.quote || "");
+          return `
+            <div class="ace-issue-row">
+              <div class="ace-issue-title">${aceEscapeHtml(issue.title || "Untitled issue")}</div>
+              <div class="ace-issue-meta">${aceEscapeHtml([issue.type, issue.priority, issue.sectionLabel].filter(Boolean).join(" | "))}</div>
+              ${snippet ? `<blockquote>${aceEscapeHtml(aceShortDiagnostic(snippet))}</blockquote>` : ""}
+              <div class="ace-actions">
+                <button class="ace-button" type="button" data-ace-action="find-quote" data-ace-issue-id="${aceEscapeHtml(issue.id)}" ${snippet ? "" : "disabled"}>Find quote</button>
+                <button class="ace-button" type="button" data-ace-action="copy-quote" data-ace-issue-id="${aceEscapeHtml(issue.id)}" ${snippet ? "" : "disabled"}>Copy quote</button>
+              </div>
+            </div>
+          `;
+        }).join("")
+      : '<div class="ace-empty">No open issues saved from this doc yet.</div>';
+    const messageCopy = message
+      ? `<div class="ace-sync-copy ace-sync-copy--pending">${aceEscapeHtml(message)}</div>`
+      : "";
+
+    aceWidget.className = "ace-widget ace-widget--issues";
+    aceWidget.innerHTML = `
+      ${aceCloseButtonHtml()}
+      <div class="ace-prompt-copy">Doc issues</div>
+      ${messageCopy}
+      <div class="ace-issue-list">${rows}</div>
+      <div class="ace-actions">
+        <button class="ace-button ace-button--primary" type="button" data-ace-action="show-issue-form">Add issue</button>
+        <button class="ace-button" type="button" data-ace-action="open">Open app</button>
+        <button class="ace-button" type="button" data-ace-action="cancel-issue">Done</button>
       </div>
     `;
     aceApplyWidgetPosition();
@@ -731,10 +1128,41 @@
     return text.length > 120 ? `${text.slice(0, 117)}...` : text;
   }
 
+  function aceCloseButtonHtml() {
+    return '<button class="ace-close-button" type="button" data-ace-action="close-popup" aria-label="Close Author Companion controls">&times;</button>';
+  }
+
+  function aceIsActiveSessionCurrent(extensionSessionId) {
+    return Boolean(extensionSessionId && aceActiveSession?.extensionSessionId === extensionSessionId);
+  }
+
+  function aceIsActiveProjectPickerCurrent(extensionSessionId) {
+    return aceIsActiveSessionCurrent(extensionSessionId)
+      && aceState === "project-picker"
+      && aceProjectPickerMode === "active";
+  }
+
+  function aceIsCompletedSessionCurrent(extensionSessionId) {
+    return Boolean(extensionSessionId && aceCompletedSession?.extensionSessionId === extensionSessionId);
+  }
+
+  function aceRunAsync(promise, label) {
+    Promise.resolve(promise).catch(function (error) {
+      console.warn(`Author Companion: ${label} failed.`, error);
+    });
+  }
+
   function aceStartTimer() {
     aceClearTimer();
+    if (!aceActiveSession) {
+      aceRenderActive();
+      return;
+    }
+
     aceRenderActive();
-    aceTimerId = window.setInterval(aceRenderActive, ACE_TIMER_INTERVAL_MS);
+    if (aceActiveSession) {
+      aceTimerId = window.setInterval(aceRenderActive, ACE_TIMER_INTERVAL_MS);
+    }
   }
 
   function aceShowStartPrompt() {
@@ -747,6 +1175,426 @@
     aceRenderPrompt();
   }
 
+  async function aceShowControls() {
+    if (aceActiveSession) {
+      aceState = "active";
+      aceStartTimer();
+      return;
+    }
+
+    if (aceCompletedSession) {
+      aceState = "completed";
+      aceRenderCompleted();
+      return;
+    }
+
+    await aceCheckCatchUpBeforeStartPrompt();
+  }
+
+  function aceRememberIssueReturnState() {
+    aceIssueReturnState = aceActiveSession
+      ? "active"
+      : aceCompletedSession
+        ? "completed"
+        : aceState === "prompt"
+          ? "prompt"
+          : "idle";
+  }
+
+  function aceReturnFromIssue() {
+    aceIssueDraft = null;
+    aceIssueStatus = "";
+    if (aceActiveSession) {
+      aceState = "active";
+      aceStartTimer();
+      return;
+    }
+
+    if (aceCompletedSession) {
+      aceState = "completed";
+      aceRenderCompleted();
+      return;
+    }
+
+    if (aceIssueReturnState === "prompt") {
+      aceState = "prompt";
+      aceRenderPrompt();
+      return;
+    }
+
+    aceState = "idle";
+    aceRenderIdle();
+  }
+
+  function aceOpenIssueForm() {
+    aceRememberIssueReturnState();
+    aceClearTimer();
+    const documentId = aceExtractDocumentId();
+    const selectedText = aceGetSelectedText();
+    aceIssueDraft = {
+      documentId,
+      documentUrl: aceDocumentUrl(),
+      extensionIssueId: aceCreateExtensionIssueId(documentId),
+      note: "",
+      snippet: selectedText
+    };
+    aceIssueStatus = selectedText ? "Selected text added as the quote." : "";
+    aceState = "issue-form";
+    aceRenderIssueForm();
+  }
+
+  function aceReadIssueFormDraft() {
+    const form = aceWidget.querySelector("[data-ace-issue-form]");
+    if (!form) {
+      return aceIssueDraft;
+    }
+
+    const formData = new FormData(form);
+    aceIssueDraft = {
+      ...(aceIssueDraft || {}),
+      documentId: aceIssueDraft?.documentId || aceExtractDocumentId(),
+      documentUrl: aceIssueDraft?.documentUrl || aceDocumentUrl(),
+      extensionIssueId: aceIssueDraft?.extensionIssueId || aceCreateExtensionIssueId(aceExtractDocumentId()),
+      note: String(formData.get("note") || ""),
+      snippet: String(formData.get("snippet") || "")
+    };
+    return aceIssueDraft;
+  }
+
+  async function aceShowIssuesList() {
+    aceRememberIssueReturnState();
+    aceClearTimer();
+    aceState = "issues-loading";
+    aceRenderLoading("Loading issues...", "Checking Author Companion.");
+    await aceNextFrame();
+
+    try {
+      const payload = await aceGetExtensionIssues(aceExtractDocumentId());
+      aceCurrentIssues = Array.isArray(payload.issues) ? payload.issues : [];
+      aceState = "issues";
+      aceRenderIssuesList();
+    } catch (error) {
+      aceCurrentIssues = [];
+      aceState = "issues";
+      aceRenderIssuesList(`Could not load issues. ${error.message}`);
+    }
+  }
+
+  async function aceSaveIssue(projectOverride) {
+    const draft = aceReadIssueFormDraft();
+    if (!draft) {
+      return;
+    }
+
+    const note = aceNormalizeIssueNoteText(draft.note);
+    if (!note) {
+      aceIssueStatus = "A short note is required.";
+      aceRenderIssueForm();
+      return;
+    }
+
+    aceState = "issue-saving";
+    aceRenderLoading("Saving issue...", "Sending it to the Edit dashboard.");
+    await aceNextFrame();
+
+    let project = projectOverride || null;
+    let projectId = String(project?.id || "").trim();
+    if (!projectId) {
+      const localBinding = await aceGetLocalDocumentBinding(draft.documentId);
+      project = localBinding?.project || null;
+      projectId = String(localBinding?.projectId || project?.id || "").trim();
+    }
+    if (!projectId && aceActiveSession?.projectId) {
+      projectId = aceActiveSession.projectId;
+    }
+    if (!projectId && aceCompletedSession?.projectId) {
+      projectId = aceCompletedSession.projectId;
+    }
+
+    if (!projectId) {
+      aceProjectPickerMode = "issue";
+      try {
+        aceProjects = await aceGetProjects();
+        aceState = "project-picker";
+        aceRenderProjectPicker();
+      } catch (error) {
+        aceIssueStatus = `Projects unavailable. ${error.message}`;
+        aceState = "issue-form";
+        aceRenderIssueForm();
+      }
+      return;
+    }
+
+    const snippet = aceNormalizeIssueNoteText(draft.snippet).slice(0, 500);
+    const payload = {
+      documentId: draft.documentId,
+      projectId,
+      extensionIssueId: draft.extensionIssueId,
+      note,
+      snippet,
+      documentUrl: draft.documentUrl,
+      source: "chrome-extension",
+      quoteLocator: {
+        strategy: "quote-finder",
+        quote: snippet,
+        createdAt: new Date().toISOString()
+      }
+    };
+
+    try {
+      const result = await acePostIssue(payload);
+      const selectedProject = result.project || project;
+      if (selectedProject) {
+        await aceSaveLocalDocumentBinding(draft.documentId, selectedProject);
+      }
+      aceCurrentIssues = [result.issue, ...aceCurrentIssues.filter(function (issue) {
+        return issue.id !== result.issue?.id;
+      })].filter(Boolean);
+      aceIssueDraft = null;
+      aceIssueStatus = "";
+      aceState = "issues";
+      aceRenderIssuesList(result.duplicate ? "Issue was already saved." : "Issue saved.");
+    } catch (error) {
+      if (error.message.includes("projectId is required")) {
+        aceProjectPickerMode = "issue";
+        try {
+          aceProjects = await aceGetProjects();
+          aceState = "project-picker";
+          aceRenderProjectPicker();
+        } catch (projectError) {
+          aceIssueStatus = `Projects unavailable. ${projectError.message}`;
+          aceState = "issue-form";
+          aceRenderIssueForm();
+        }
+        return;
+      }
+
+      aceIssueStatus = `Issue not saved. ${error.message}`;
+      aceState = "issue-form";
+      aceRenderIssueForm();
+    }
+  }
+
+  async function aceChooseProjectForIssue(projectId) {
+    const draft = aceIssueDraft;
+    const project = aceProjects.find(function (item) {
+      return String(item.id) === String(projectId);
+    });
+    if (!draft || !project) {
+      return;
+    }
+
+    try {
+      const binding = await aceSaveBinding(draft.documentId, project.id);
+      const selectedProject = binding.project || project;
+      await aceSaveLocalDocumentBinding(draft.documentId, selectedProject);
+      if (aceIssueDraft !== draft) {
+        return;
+      }
+      await aceSaveIssue(selectedProject);
+    } catch (error) {
+      if (aceIssueDraft !== draft) {
+        return;
+      }
+      aceIssueStatus = `Project not saved. ${error.message}`;
+      aceState = "issue-form";
+      aceRenderIssueForm();
+    }
+  }
+
+  async function aceCopyText(text) {
+    const value = String(text || "");
+    if (!value) {
+      return false;
+    }
+
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(value);
+        return true;
+      } catch (_error) {
+        // Fall through to the legacy copy path.
+      }
+    }
+
+    const textarea = document.createElement("textarea");
+    textarea.value = value;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.left = "-9999px";
+    document.documentElement.appendChild(textarea);
+    textarea.select();
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch (_error) {
+      copied = false;
+    }
+    textarea.remove();
+    return copied;
+  }
+
+  function aceFindIssueById(issueId) {
+    return aceCurrentIssues.find(function (issue) {
+      return String(issue.id) === String(issueId);
+    });
+  }
+
+  function aceIssueQuote(issue) {
+    return aceNormalizeIssueNoteText(issue?.snippet || issue?.quoteLocator?.quote || "");
+  }
+
+  function aceQuoteSearchCandidates(quote) {
+    const normalizedQuote = aceNormalizeIssueNoteText(quote);
+    const candidates = [
+      normalizedQuote,
+      normalizedQuote.slice(0, 180),
+      normalizedQuote.slice(0, 120),
+      normalizedQuote.slice(0, 80)
+    ];
+    const sentence = normalizedQuote.match(/^.{24,}?[.!?](\s|$)/);
+    if (sentence?.[0]) {
+      candidates.push(sentence[0]);
+    }
+
+    return [...new Set(candidates.map(aceNormalizeIssueNoteText))]
+      .filter(function (candidate) {
+        return candidate.length >= 24;
+      });
+  }
+
+  async function aceFindQuoteInDocument(quote) {
+    if (!window.find) {
+      return false;
+    }
+
+    const previousDisplay = aceWidget.style.display;
+    const previousVisibility = aceWidget.style.visibility;
+    aceWidget.style.display = "none";
+    aceWidget.style.visibility = "hidden";
+    await aceNextFrame();
+
+    let found = false;
+    try {
+      document.activeElement?.blur?.();
+      window.getSelection?.().removeAllRanges?.();
+      found = aceQuoteSearchCandidates(quote).some(function (candidate) {
+        return Boolean(window.find(candidate, false, false, true, false, true, false));
+      });
+    } catch (_error) {
+      found = false;
+    }
+
+    aceWidget.style.display = previousDisplay;
+    aceWidget.style.visibility = previousVisibility;
+    return found;
+  }
+
+  async function aceCopyIssueQuote(issueId) {
+    const issue = aceFindIssueById(issueId);
+    const quote = aceIssueQuote(issue);
+    const copied = await aceCopyText(quote);
+    aceRenderIssuesList(copied ? "Quote copied." : "Could not copy the quote.");
+  }
+
+  async function aceFindIssueQuote(issueId) {
+    const issue = aceFindIssueById(issueId);
+    const quote = aceIssueQuote(issue);
+    if (!quote) {
+      aceRenderIssuesList("No quote saved for that issue.");
+      return;
+    }
+
+    const found = await aceFindQuoteInDocument(quote);
+    await aceCopyText(quote);
+    const shortcut = navigator.platform.toLowerCase().includes("mac") ? "Cmd+F" : "Ctrl+F";
+    if (found) {
+      aceMinimizeWidget();
+      return;
+    }
+
+    aceRenderIssuesList(`Quote copied. Press ${shortcut}, paste it, and Google Docs will jump to the passage.`);
+  }
+
+  async function aceCheckCatchUpBeforeStartPrompt() {
+    aceState = "checking-catch-up";
+    acePromptError = "";
+    aceRenderLoading("Checking progress...", "Looking for missed words.");
+    await aceNextFrame();
+
+    const documentId = aceExtractDocumentId();
+    const baseline = await aceGetDocumentBaseline(documentId);
+    if (!baseline || !Number.isFinite(Number(baseline.endDocumentWordCount))) {
+      aceState = "idle";
+      aceShowStartPrompt();
+      return;
+    }
+
+    const currentSnapshot = await aceGoogleDocWordCount(documentId, true);
+    if (!currentSnapshot.ok || !Number.isFinite(currentSnapshot.wordCount)) {
+      acePromptError = `Could not check for missed words. ${currentSnapshot.error || "You can still start a session."}`;
+      aceState = "idle";
+      aceShowStartPrompt();
+      return;
+    }
+
+    const baselineWordCount = Math.max(0, Number(baseline.endDocumentWordCount) || 0);
+    const currentWordCount = Math.max(0, Number(currentSnapshot.wordCount) || 0);
+    const wordsWritten = currentWordCount - baselineWordCount;
+    if (wordsWritten <= 0) {
+      aceState = "idle";
+      aceShowStartPrompt();
+      return;
+    }
+
+    aceCatchUpCandidate = {
+      documentId,
+      documentUrl: aceDocumentUrl(),
+      baseline,
+      currentSnapshot,
+      startDocumentWordCount: baselineWordCount,
+      endDocumentWordCount: currentWordCount,
+      wordsWritten
+    };
+    aceSyncStatus = "";
+    aceSyncMessage = "";
+    aceState = "catch-up";
+    aceRenderCatchUpPrompt();
+  }
+
+  function aceSkipCatchUp() {
+    aceCatchUpCandidate = null;
+    aceSyncStatus = "";
+    aceSyncMessage = "";
+    aceState = "idle";
+    aceShowStartPrompt();
+  }
+
+  function aceMinimizeWidget() {
+    if (aceActiveSession) {
+      aceState = "active-minimized";
+      aceClearTimer();
+      aceRunAsync(acePersistActiveSession(), "persist minimized session");
+      aceRenderIdle();
+      return;
+    }
+
+    if (aceCompletedSession) {
+      aceState = "completed-minimized";
+      aceRenderIdle();
+      return;
+    }
+
+    aceState = "idle";
+    aceProjectPickerMode = "completed";
+    aceSyncStatus = "";
+    aceSyncMessage = "";
+    aceProjects = [];
+    aceCatchUpCandidate = null;
+    aceResetPromptState();
+    aceRenderIdle();
+  }
+
   async function aceStartSession() {
     if (aceState !== "prompt") {
       return;
@@ -754,7 +1602,8 @@
 
     aceState = "starting";
     acePromptError = "";
-    aceRenderMessage("Starting...");
+    aceRenderLoading("Starting...", "Checking Google Docs.");
+    await aceNextFrame();
 
     const documentId = aceExtractDocumentId();
     const now = new Date().toISOString();
@@ -780,6 +1629,7 @@
       wordsAdded: 0,
       wordsRemoved: 0,
       netWordsChanged: 0,
+      hadDocumentActivity: false,
       startDocumentWordCount: Number.isFinite(startSnapshot.wordCount)
         ? startSnapshot.wordCount
         : null,
@@ -790,7 +1640,7 @@
     aceClearActivityTimers();
     await acePersistActiveSession();
     aceStartTimer();
-    aceResolveBindingForActiveSession();
+    aceRunAsync(aceResolveBindingForActiveSession(), "resolve active session binding");
   }
 
   async function aceRestoreSession() {
@@ -823,10 +1673,24 @@
 
     aceState = "completed";
     aceCompletedSession = pendingSession;
-    aceSyncStatus = "pending";
-    aceSyncMessage = "Not synced yet.";
+    aceSyncStatus = "syncing";
+    aceSyncMessage = "Checking Google Docs...";
     aceSelectedProject = null;
     aceRenderCompleted();
+    aceRunAsync(aceAutoSyncRestoredSession(), "auto-sync restored session");
+  }
+
+  async function aceAutoSyncRestoredSession() {
+    if (!aceCompletedSession?.extensionSessionId) {
+      return;
+    }
+
+    if (aceAutoSyncRestoreId === aceCompletedSession.extensionSessionId) {
+      return;
+    }
+
+    aceAutoSyncRestoreId = aceCompletedSession.extensionSessionId;
+    await aceResolveAndSyncCompletedSession(false);
   }
 
   async function aceSwitchSessionType() {
@@ -858,23 +1722,34 @@
     aceRenderIdle();
   }
 
-  async function aceEndSession() {
-    if (aceState !== "active" || !aceActiveSession) {
+  async function aceEndSession(options = {}) {
+    const fromUnload = Boolean(options.fromUnload);
+    const activeSession = aceActiveSession;
+    if ((aceState !== "active" && aceState !== "active-minimized") || !activeSession) {
       return;
     }
 
     aceState = "ending";
     aceClearActivityTimers();
     aceClearTimer();
-    aceRenderMessage("Ending...");
 
     const endedAt = new Date().toISOString();
     const elapsedMs = aceElapsedMs();
-    const documentId = aceActiveSession.documentId || aceExtractDocumentId();
+    const documentId = activeSession.documentId || aceExtractDocumentId();
+    if (fromUnload) {
+      await aceStoreAutoEndedSession(activeSession, endedAt, elapsedMs, documentId);
+      return;
+    }
+
+    aceRenderLoading("Ending session...", "Measuring words from Google Docs.");
+    await aceNextFrame();
+
     const wordDiff = await aceGoogleDocDiffAfterSave(
       documentId,
-      aceActiveSession.extensionSessionId,
-      aceActiveSession.startDocumentWordCount
+      activeSession.extensionSessionId,
+      activeSession.startDocumentWordCount,
+      activeSession.startDocumentRevisionId,
+      activeSession.hadDocumentActivity
     );
     const endDocumentWordCount = Number.isFinite(wordDiff.wordCount)
       ? wordDiff.wordCount
@@ -883,8 +1758,8 @@
     const wordsRemoved = Math.max(0, Number(wordDiff.wordsRemoved) || 0);
     const netWordsChanged = Number.isFinite(wordDiff.netWordsChanged)
       ? wordDiff.netWordsChanged
-      : Number.isFinite(aceActiveSession.startDocumentWordCount) && Number.isFinite(endDocumentWordCount)
-        ? endDocumentWordCount - aceActiveSession.startDocumentWordCount
+      : Number.isFinite(activeSession.startDocumentWordCount) && Number.isFinite(endDocumentWordCount)
+        ? endDocumentWordCount - activeSession.startDocumentWordCount
         : 0;
     const measuredWordsWritten = Math.max(0, netWordsChanged);
     const measuredWordsEdited = wordsAdded + wordsRemoved;
@@ -893,29 +1768,31 @@
       ? wordDiff.error || "Google Docs word count unavailable."
       : "";
     aceCompletedSession = {
-      documentId: aceActiveSession.documentId || aceExtractDocumentId(),
-      projectId: aceActiveSession.projectId || "",
-      sessionType: aceActiveSession.sessionType || "writing",
-      startedAt: aceActiveSession.startedAt,
+      documentId: activeSession.documentId || aceExtractDocumentId(),
+      projectId: activeSession.projectId || "",
+      sessionType: activeSession.sessionType || "writing",
+      startedAt: activeSession.startedAt,
       endedAt,
       durationMinutes: aceDurationMinutes(elapsedMs),
       source: "chrome-extension",
-      documentUrl: aceActiveSession.documentUrl || aceDocumentUrl(),
+      documentUrl: activeSession.documentUrl || aceDocumentUrl(),
       notes: "",
-      extensionSessionId: aceActiveSession.extensionSessionId,
-      wordsWritten: aceActiveSession.sessionType === "writing" && !measurementPending ? measuredWordsWritten : 0,
-      wordsEdited: aceActiveSession.sessionType === "editing" && !measurementPending ? measuredWordsEdited : 0,
+      extensionSessionId: activeSession.extensionSessionId,
+      wordsWritten: activeSession.sessionType === "writing" && !measurementPending ? measuredWordsWritten : 0,
+      wordsEdited: activeSession.sessionType === "editing" && !measurementPending ? measuredWordsEdited : 0,
       wordsAdded: measurementPending ? 0 : wordsAdded,
       wordsRemoved: measurementPending ? 0 : wordsRemoved,
       netWordsChanged: measurementPending ? 0 : netWordsChanged,
-      startDocumentWordCount: Number.isFinite(aceActiveSession.startDocumentWordCount)
-        ? aceActiveSession.startDocumentWordCount
+      startDocumentWordCount: Number.isFinite(activeSession.startDocumentWordCount)
+        ? activeSession.startDocumentWordCount
         : null,
+      startDocumentRevisionId: activeSession.startDocumentRevisionId || "",
       endDocumentWordCount: Number.isFinite(endDocumentWordCount)
         ? endDocumentWordCount
         : null,
       wordCountMethod: "google-docs-api",
       wordCountError,
+      hadDocumentActivity: Boolean(activeSession.hadDocumentActivity),
       measurementPending
     };
 
@@ -929,8 +1806,42 @@
     if (measurementPending) {
       await aceMarkSessionUnsynced(`Google Docs count unavailable. ${wordCountError}`);
     } else {
-      aceResolveAndSyncCompletedSession(false);
+      aceRunAsync(aceResolveAndSyncCompletedSession(false), "sync completed session");
     }
+  }
+
+  async function aceStoreAutoEndedSession(activeSession, endedAt, elapsedMs, documentId) {
+    const session = {
+      documentId: activeSession.documentId || documentId,
+      projectId: activeSession.projectId || "",
+      sessionType: activeSession.sessionType || "writing",
+      startedAt: activeSession.startedAt,
+      endedAt,
+      durationMinutes: aceDurationMinutes(elapsedMs),
+      source: "chrome-extension",
+      documentUrl: activeSession.documentUrl || aceDocumentUrl(),
+      notes: "",
+      extensionSessionId: activeSession.extensionSessionId,
+      wordsWritten: 0,
+      wordsEdited: 0,
+      wordsAdded: 0,
+      wordsRemoved: 0,
+      netWordsChanged: 0,
+      startDocumentWordCount: Number.isFinite(activeSession.startDocumentWordCount)
+        ? activeSession.startDocumentWordCount
+        : null,
+      startDocumentRevisionId: activeSession.startDocumentRevisionId || "",
+      endDocumentWordCount: null,
+      wordCountMethod: "google-docs-api",
+      wordCountError: "Document closed before Google Docs word count completed.",
+      hadDocumentActivity: Boolean(activeSession.hadDocumentActivity),
+      measurementPending: true
+    };
+
+    aceCompletedSession = session;
+    aceActiveSession = null;
+    await acePersistActiveSession();
+    await aceStorePendingSession(session);
   }
 
   async function aceStartNew() {
@@ -950,14 +1861,23 @@
   }
 
   async function aceResolveBindingForActiveSession() {
-    if (!aceActiveSession?.documentId) {
+    const extensionSessionId = aceActiveSession?.extensionSessionId;
+    const documentId = aceActiveSession?.documentId;
+    if (!extensionSessionId || !documentId) {
       return;
     }
 
     try {
-      const binding = await aceGetBinding(aceActiveSession.documentId);
-      if (binding.project?.id) {
-        aceActiveSession.projectId = binding.project.id;
+      const binding = await aceGetLocalDocumentBinding(documentId);
+      if (!aceIsActiveSessionCurrent(extensionSessionId)) {
+        return;
+      }
+
+      if (binding?.projectId) {
+        aceActiveSession = {
+          ...aceActiveSession,
+          projectId: binding.projectId
+        };
         await acePersistActiveSession();
       }
     } catch (_error) {
@@ -966,13 +1886,17 @@
   }
 
   async function aceResolveAndSyncCompletedSession(forcePicker) {
-    if (!aceCompletedSession) {
+    const completedSessionId = aceCompletedSession?.extensionSessionId;
+    if (!completedSessionId) {
       return;
     }
 
     if (aceCompletedSession.measurementPending) {
       const measured = await aceMeasureCompletedSession();
       if (!measured) {
+        return;
+      }
+      if (!aceIsCompletedSessionCurrent(completedSessionId)) {
         return;
       }
     }
@@ -983,21 +1907,41 @@
 
     try {
       if (!forcePicker) {
-        const binding = await aceGetBinding(aceCompletedSession.documentId);
-        if (binding.project?.id) {
-          aceCompletedSession.projectId = binding.project.id;
-          aceSelectedProject = binding.project;
+        const documentId = aceCompletedSession?.documentId;
+        if (!documentId) {
+          return;
+        }
+
+        const binding = await aceGetLocalDocumentBinding(documentId);
+        if (!aceIsCompletedSessionCurrent(completedSessionId)) {
+          return;
+        }
+
+        if (binding?.projectId) {
+          aceCompletedSession = {
+            ...aceCompletedSession,
+            projectId: binding.projectId
+          };
+          aceSelectedProject = binding.project || null;
           await aceSyncCompletedSession();
           return;
         }
       }
 
       aceProjects = await aceGetProjects();
+      if (!aceIsCompletedSessionCurrent(completedSessionId)) {
+        return;
+      }
+
       aceState = "project-picker";
       aceSyncStatus = "";
       aceSyncMessage = "";
       aceRenderProjectPicker();
     } catch (error) {
+      if (!aceIsCompletedSessionCurrent(completedSessionId)) {
+        return;
+      }
+
       await aceMarkSessionUnsynced(error.message);
     }
   }
@@ -1008,54 +1952,126 @@
       return;
     }
 
-    if (!aceCompletedSession) {
+    if (aceProjectPickerMode === "catch-up") {
+      await aceChooseProjectForCatchUp(projectId);
+      return;
+    }
+
+    if (aceProjectPickerMode === "issue") {
+      await aceChooseProjectForIssue(projectId);
+      return;
+    }
+
+    const completedSessionId = aceCompletedSession?.extensionSessionId;
+    const documentId = aceCompletedSession?.documentId;
+    if (!completedSessionId || !documentId) {
       return;
     }
 
     const project = aceProjects.find(function (item) {
-      return item.id === projectId;
+      return String(item.id) === String(projectId);
     });
     if (!project) {
       return;
     }
 
     aceSelectedProject = project;
-    aceCompletedSession.projectId = project.id;
+    aceCompletedSession = {
+      ...aceCompletedSession,
+      projectId: project.id
+    };
     aceState = "completed";
     aceSyncStatus = "syncing";
     aceSyncMessage = "Saving project...";
     aceRenderCompleted();
 
     try {
-      const binding = await aceSaveBinding(aceCompletedSession.documentId, project.id);
+      const binding = await aceSaveBinding(documentId, project.id);
+      if (!aceIsCompletedSessionCurrent(completedSessionId)) {
+        return;
+      }
+
       aceSelectedProject = binding.project || project;
+      await aceSaveLocalDocumentBinding(documentId, aceSelectedProject);
+      if (!aceIsCompletedSessionCurrent(completedSessionId)) {
+        return;
+      }
+
       await aceSyncCompletedSession();
     } catch (error) {
+      if (!aceIsCompletedSessionCurrent(completedSessionId)) {
+        return;
+      }
+
       await aceMarkSessionUnsynced(error.message);
     }
   }
 
   async function aceChooseProjectForActiveSession(projectId) {
-    if (!aceActiveSession) {
+    const extensionSessionId = aceActiveSession?.extensionSessionId;
+    const documentId = aceActiveSession?.documentId;
+    if (!extensionSessionId || !documentId) {
       return;
     }
 
     const project = aceProjects.find(function (item) {
-      return item.id === projectId;
+      return String(item.id) === String(projectId);
     });
     if (!project) {
       return;
     }
 
     try {
-      const binding = await aceSaveBinding(aceActiveSession.documentId, project.id);
-      aceActiveSession.projectId = project.id;
+      const binding = await aceSaveBinding(documentId, project.id);
+      if (!aceIsActiveSessionCurrent(extensionSessionId)) {
+        return;
+      }
+
+      aceActiveSession = {
+        ...aceActiveSession,
+        projectId: project.id
+      };
       aceSelectedProject = binding.project || project;
+      await aceSaveLocalDocumentBinding(documentId, aceSelectedProject);
+      if (!aceIsActiveSessionCurrent(extensionSessionId)) {
+        return;
+      }
+
       await acePersistActiveSession();
+      if (!aceIsActiveSessionCurrent(extensionSessionId)) {
+        return;
+      }
+
+      if (aceState === "active-minimized") {
+        aceProjectPickerMode = "completed";
+        aceClearTimer();
+        aceRenderIdle();
+        return;
+      }
+
+      if (aceState !== "project-picker" && aceState !== "active") {
+        return;
+      }
+
       aceState = "active";
       aceProjectPickerMode = "completed";
       aceStartTimer();
     } catch (error) {
+      if (!aceIsActiveSessionCurrent(extensionSessionId)) {
+        return;
+      }
+
+      if (aceState === "active-minimized") {
+        aceProjectPickerMode = "completed";
+        aceClearTimer();
+        aceRenderIdle();
+        return;
+      }
+
+      if (aceState !== "project-picker" && aceState !== "active") {
+        return;
+      }
+
       aceState = "active";
       aceSyncStatus = "pending";
       aceSyncMessage = `Project not changed. ${error.message}`;
@@ -1064,8 +2080,155 @@
     }
   }
 
+  async function aceChooseProjectForCatchUp(projectId) {
+    const catchUpCandidate = aceCatchUpCandidate;
+    if (!catchUpCandidate) {
+      return;
+    }
+
+    const project = aceProjects.find(function (item) {
+      return String(item.id) === String(projectId);
+    });
+    if (!project) {
+      return;
+    }
+
+    try {
+      const binding = await aceSaveBinding(catchUpCandidate.documentId, project.id);
+      if (aceCatchUpCandidate !== catchUpCandidate) {
+        return;
+      }
+
+      const selectedProject = binding.project || project;
+      await aceSaveLocalDocumentBinding(catchUpCandidate.documentId, selectedProject);
+      if (aceCatchUpCandidate !== catchUpCandidate) {
+        return;
+      }
+
+      await aceSyncCatchUpSession(selectedProject);
+    } catch (error) {
+      if (aceCatchUpCandidate !== catchUpCandidate) {
+        return;
+      }
+
+      aceSyncStatus = "pending";
+      aceSyncMessage = `Catch-up not synced. ${error.message}`;
+      aceState = "catch-up";
+      aceRenderCatchUpPrompt();
+    }
+  }
+
+  async function aceSyncCatchUpSession(projectOverride) {
+    const catchUpCandidate = aceCatchUpCandidate;
+    if (!catchUpCandidate) {
+      return;
+    }
+
+    aceState = "catch-up-syncing";
+    aceRenderLoading("Adding missed words...", "Saving catch-up session.");
+    await aceNextFrame();
+
+    if (aceCatchUpCandidate !== catchUpCandidate) {
+      return;
+    }
+
+    let project = projectOverride || catchUpCandidate.baseline?.project || null;
+    let projectId = String(project?.id || catchUpCandidate.baseline?.projectId || "").trim();
+    if (!projectId) {
+      const binding = await aceGetLocalDocumentBinding(catchUpCandidate.documentId);
+      if (aceCatchUpCandidate !== catchUpCandidate) {
+        return;
+      }
+
+      project = binding?.project || project;
+      projectId = String(binding?.projectId || project?.id || "").trim();
+    }
+
+    if (!projectId) {
+      aceProjectPickerMode = "catch-up";
+      try {
+        aceProjects = await aceGetProjects();
+        if (aceCatchUpCandidate !== catchUpCandidate) {
+          return;
+        }
+
+        aceState = "project-picker";
+        aceRenderProjectPicker();
+      } catch (error) {
+        if (aceCatchUpCandidate !== catchUpCandidate) {
+          return;
+        }
+
+        aceSyncStatus = "pending";
+        aceSyncMessage = `Projects unavailable. ${error.message}`;
+        aceState = "catch-up";
+        aceRenderCatchUpPrompt();
+      }
+      return;
+    }
+
+    const endedAt = new Date().toISOString();
+    const startedAt = new Date(Date.now() - 60000).toISOString();
+    const wordsWritten = Math.max(0, Number(catchUpCandidate.wordsWritten) || 0);
+    const catchUpSession = {
+      documentId: catchUpCandidate.documentId,
+      projectId,
+      sessionType: "writing",
+      startedAt,
+      endedAt,
+      durationMinutes: 1,
+      source: "chrome-extension",
+      documentUrl: catchUpCandidate.documentUrl || aceDocumentUrl(),
+      notes: "Catch-up: words added outside a tracked session.",
+      extensionSessionId: aceCreateExtensionSessionId(catchUpCandidate.documentId),
+      wordsWritten,
+      wordsEdited: 0,
+      wordsAdded: 0,
+      wordsRemoved: 0,
+      netWordsChanged: wordsWritten,
+      startDocumentWordCount: catchUpCandidate.startDocumentWordCount,
+      startDocumentRevisionId: catchUpCandidate.baseline?.revisionId || "",
+      endDocumentWordCount: catchUpCandidate.endDocumentWordCount,
+      wordCountMethod: "google-docs-api",
+      wordCountError: "",
+      hadDocumentActivity: true,
+      measurementPending: false
+    };
+
+    try {
+      const result = await acePostSession(catchUpSession);
+      if (aceCatchUpCandidate !== catchUpCandidate) {
+        return;
+      }
+
+      const syncedProject = result.project || project || catchUpCandidate.baseline?.project || null;
+      await aceSaveDocumentBaseline(catchUpSession, syncedProject);
+      if (aceCatchUpCandidate !== catchUpCandidate) {
+        return;
+      }
+
+      aceCatchUpCandidate = null;
+      aceProjectPickerMode = "completed";
+      aceSelectedProject = syncedProject;
+      aceSyncStatus = "";
+      aceSyncMessage = "";
+      aceState = "idle";
+      aceShowStartPrompt();
+    } catch (error) {
+      if (aceCatchUpCandidate !== catchUpCandidate) {
+        return;
+      }
+
+      aceSyncStatus = "pending";
+      aceSyncMessage = `Catch-up not synced. ${error.message}`;
+      aceState = "catch-up";
+      aceRenderCatchUpPrompt();
+    }
+  }
+
   async function aceShowProjectPickerForActiveSession() {
-    if (!aceActiveSession) {
+    const extensionSessionId = aceActiveSession?.extensionSessionId;
+    if (!extensionSessionId) {
       return;
     }
 
@@ -1079,8 +2242,16 @@
 
     try {
       aceProjects = await aceGetProjects();
+      if (!aceIsActiveProjectPickerCurrent(extensionSessionId)) {
+        return;
+      }
+
       aceRenderProjectPicker();
     } catch (error) {
+      if (!aceIsActiveProjectPickerCurrent(extensionSessionId)) {
+        return;
+      }
+
       aceState = "active";
       aceProjectPickerMode = "completed";
       aceStartTimer();
@@ -1088,6 +2259,11 @@
   }
 
   async function aceSyncCompletedSession() {
+    const completedSessionId = aceCompletedSession?.extensionSessionId;
+    if (!completedSessionId) {
+      return;
+    }
+
     if (!aceCompletedSession?.projectId) {
       await aceResolveAndSyncCompletedSession(true);
       return;
@@ -1098,6 +2274,9 @@
       if (!measured) {
         return;
       }
+      if (!aceIsCompletedSessionCurrent(completedSessionId)) {
+        return;
+      }
     }
 
     aceSyncStatus = "syncing";
@@ -1105,13 +2284,31 @@
     aceRenderCompleted();
 
     try {
-      const result = await acePostSession(aceCompletedSession);
+      const sessionToSync = aceCompletedSession;
+      const result = await acePostSession(sessionToSync);
+      if (!aceIsCompletedSessionCurrent(completedSessionId)) {
+        return;
+      }
+
       aceSelectedProject = result.project || aceSelectedProject;
       aceSyncStatus = "synced";
       aceSyncMessage = result.duplicate ? "Already synced." : "Synced.";
-      await aceRemovePendingSession(aceCompletedSession.extensionSessionId);
+      await aceSaveDocumentBaseline(sessionToSync, aceSelectedProject);
+      if (!aceIsCompletedSessionCurrent(completedSessionId)) {
+        return;
+      }
+
+      await aceRemovePendingSession(completedSessionId);
     } catch (error) {
+      if (!aceIsCompletedSessionCurrent(completedSessionId)) {
+        return;
+      }
+
       await aceMarkSessionUnsynced(error.message);
+      return;
+    }
+
+    if (!aceIsCompletedSessionCurrent(completedSessionId)) {
       return;
     }
 
@@ -1119,7 +2316,9 @@
   }
 
   async function aceMeasureCompletedSession() {
-    if (!aceCompletedSession?.measurementPending) {
+    const completedSession = aceCompletedSession;
+    const completedSessionId = completedSession?.extensionSessionId;
+    if (!completedSession?.measurementPending) {
       return true;
     }
 
@@ -1128,10 +2327,16 @@
     aceRenderCompleted();
 
     const wordDiff = await aceGoogleDocDiffAfterSave(
-      aceCompletedSession.documentId,
-      aceCompletedSession.extensionSessionId,
-      aceCompletedSession.startDocumentWordCount
+      completedSession.documentId,
+      completedSession.extensionSessionId,
+      completedSession.startDocumentWordCount,
+      completedSession.startDocumentRevisionId,
+      completedSession.hadDocumentActivity
     );
+    if (!aceIsCompletedSessionCurrent(completedSessionId)) {
+      return false;
+    }
+
     if (!wordDiff.ok || !Number.isFinite(wordDiff.wordCount)) {
       await aceMarkSessionUnsynced(`Google Docs count unavailable. ${wordDiff.error || "Try again shortly."}`);
       return false;
@@ -1141,12 +2346,12 @@
     const wordsRemoved = Math.max(0, Number(wordDiff.wordsRemoved) || 0);
     const netWordsChanged = Number.isFinite(wordDiff.netWordsChanged)
       ? wordDiff.netWordsChanged
-      : Number(wordDiff.wordCount) - Number(aceCompletedSession.startDocumentWordCount);
+      : Number(wordDiff.wordCount) - Number(completedSession.startDocumentWordCount);
 
     aceCompletedSession = {
       ...aceCompletedSession,
-      wordsWritten: aceCompletedSession.sessionType === "writing" ? Math.max(0, netWordsChanged) : 0,
-      wordsEdited: aceCompletedSession.sessionType === "editing" ? wordsAdded + wordsRemoved : 0,
+      wordsWritten: completedSession.sessionType === "writing" ? Math.max(0, netWordsChanged) : 0,
+      wordsEdited: completedSession.sessionType === "editing" ? wordsAdded + wordsRemoved : 0,
       wordsAdded,
       wordsRemoved,
       netWordsChanged,
@@ -1189,6 +2394,8 @@
   }
 
   function aceRegisterWritingActivity() {
+    aceNoteActiveDocumentActivity();
+
     if (ACE_IS_TOP_FRAME) {
       aceSchedulePrompt();
       return;
@@ -1197,28 +2404,28 @@
     window.top.postMessage({ aceType: ACE_ACTIVITY_MESSAGE }, "*");
   }
 
-  function aceSchedulePrompt() {
-    if (aceState !== "idle") {
+  function aceNoteActiveDocumentActivity() {
+    if (
+      (aceState !== "active" && aceState !== "active-minimized")
+      || !aceActiveSession
+      || aceActiveSession.hadDocumentActivity
+    ) {
       return;
     }
 
-    if (!aceStartTimerId) {
-      aceRenderDetecting();
-      aceStartTimerId = window.setTimeout(aceShowStartPrompt, ACE_START_DELAY_MS);
-    }
+    aceActiveSession.hadDocumentActivity = true;
+    aceRunAsync(acePersistActiveSession(), "persist document activity");
+  }
 
-    if (aceActivityGapTimerId) {
-      window.clearTimeout(aceActivityGapTimerId);
-    }
-
-    aceActivityGapTimerId = window.setTimeout(function () {
-      aceClearActivityTimers();
-      aceResetPromptState();
-      aceRenderIdle();
-    }, ACE_ACTIVITY_GAP_MS);
+  function aceSchedulePrompt() {
+    // Sessions are started explicitly from the corner icon.
   }
 
   function aceHandleKeydown(event) {
+    if (aceWidget?.contains(event.target)) {
+      return;
+    }
+
     if (!aceIsWritingActivity(event)) {
       return;
     }
@@ -1227,6 +2434,10 @@
   }
 
   function aceHandleInputLikeActivity(event) {
+    if (aceWidget?.contains(event.target)) {
+      return;
+    }
+
     if (event.inputType && event.inputType.startsWith("format")) {
       return;
     }
@@ -1235,6 +2446,10 @@
   }
 
   function aceHandleClipboardActivity() {
+    if (aceWidget?.contains(document.activeElement)) {
+      return;
+    }
+
     aceRegisterWritingActivity();
   }
 
@@ -1303,7 +2518,16 @@
   }
 
   function aceHandlePointerDown(event) {
-    if (event.button !== 0 || event.target.closest("button")) {
+    if (event.button !== 0) {
+      return;
+    }
+
+    if (aceClosest(event.target, "input, textarea, select, label")) {
+      event.stopPropagation();
+      return;
+    }
+
+    if (aceHandleWidgetDecision(event, "pointer")) {
       return;
     }
 
@@ -1346,6 +2570,123 @@
     aceApplyWidgetPosition();
   }
 
+  function aceHandleWidgetDecision(event, source) {
+    const projectButton = aceClosest(event.target, "[data-ace-project-id]");
+    if (projectButton && aceWidget.contains(projectButton)) {
+      aceConsumeWidgetEvent(event);
+      if (source === "click" && Date.now() - aceLastPointerActionAt < 600) {
+        return true;
+      }
+
+      if (source === "pointer") {
+        aceLastPointerActionAt = Date.now();
+      }
+
+      aceRunAsync(aceChooseProject(projectButton.getAttribute("data-ace-project-id")), "choose project");
+      return true;
+    }
+
+    const button = aceClosest(event.target, "[data-ace-action]");
+    if (!button || !aceWidget.contains(button)) {
+      return false;
+    }
+
+    aceConsumeWidgetEvent(event);
+    if (button.disabled) {
+      return true;
+    }
+
+    if (source === "click" && Date.now() - aceLastPointerActionAt < 600) {
+      return true;
+    }
+
+    if (source === "pointer") {
+      aceLastPointerActionAt = Date.now();
+    }
+
+    const action = button.getAttribute("data-ace-action");
+
+    if (action === "confirm-start") {
+      aceRunAsync(aceStartSession(), "start session");
+    } else if (action === "show-controls") {
+      aceRunAsync(aceShowControls(), "show controls");
+    } else if (action === "show-issue-form") {
+      aceOpenIssueForm();
+    } else if (action === "save-issue") {
+      aceRunAsync(aceSaveIssue(), "save issue");
+    } else if (action === "cancel-issue") {
+      aceReturnFromIssue();
+    } else if (action === "show-issues") {
+      aceRunAsync(aceShowIssuesList(), "show issues");
+    } else if (action === "copy-quote") {
+      aceRunAsync(aceCopyIssueQuote(button.getAttribute("data-ace-issue-id")), "copy quote");
+    } else if (action === "find-quote") {
+      aceRunAsync(aceFindIssueQuote(button.getAttribute("data-ace-issue-id")), "find quote");
+    } else if (action === "close-popup") {
+      aceMinimizeWidget();
+    } else if (action === "add-catch-up") {
+      aceRunAsync(aceSyncCatchUpSession(), "sync catch-up session");
+    } else if (action === "skip-catch-up") {
+      aceSkipCatchUp();
+    } else if (action === "decline-start") {
+      aceDeclineStart();
+    } else if (action === "end") {
+      aceRunAsync(aceEndSession(), "end session");
+    } else if (action === "switch") {
+      aceRunAsync(aceSwitchSessionType(), "switch session type");
+    } else if (action === "open") {
+      aceOpenApp();
+    } else if (action === "refresh-page") {
+      window.location.reload();
+    } else if (action === "retry-sync") {
+      if (aceProjectPickerMode === "issue" && aceIssueDraft) {
+        aceRunAsync(aceSaveIssue(), "retry issue project picker");
+      } else if (aceProjectPickerMode === "catch-up" && aceCatchUpCandidate) {
+        aceRunAsync(aceSyncCatchUpSession(), "retry catch-up project picker");
+      } else if (aceCompletedSession?.projectId) {
+        aceRunAsync(aceSyncCompletedSession(), "retry completed session sync");
+      } else {
+        aceRunAsync(aceResolveAndSyncCompletedSession(false), "resolve completed session sync");
+      }
+    } else if (action === "change-project") {
+      if (aceCompletedSession) {
+        aceRunAsync(aceResolveAndSyncCompletedSession(true), "change completed session project");
+      } else if (aceActiveSession) {
+        aceRunAsync(aceShowProjectPickerForActiveSession(), "show active project picker");
+      }
+    } else if (action === "start-new") {
+      aceRunAsync(aceStartNew(), "start new session flow");
+    }
+
+    return true;
+  }
+
+  function aceConsumeWidgetEvent(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.stopImmediatePropagation) {
+      event.stopImmediatePropagation();
+    }
+  }
+
+  function aceHandleWidgetInput(event) {
+    const form = aceClosest(event.target, "[data-ace-issue-form]");
+    if (!form || !aceWidget.contains(form)) {
+      return;
+    }
+
+    aceReadIssueFormDraft();
+    aceIssueStatus = "";
+    const preview = aceWidget.querySelector(".ace-preview");
+    if (preview) {
+      preview.textContent = aceIssuePreviewCopy(aceIssueDraft?.note || "");
+    }
+    const status = aceWidget.querySelector(".ace-sync-copy--pending");
+    if (status && status.textContent === "Selected text added as the quote.") {
+      status.remove();
+    }
+  }
+
   document.addEventListener("beforeinput", aceHandleInputLikeActivity, true);
   document.addEventListener("input", aceHandleInputLikeActivity, true);
   document.addEventListener("keydown", aceHandleKeydown, true);
@@ -1358,6 +2699,7 @@
         return;
       }
 
+      aceNoteActiveDocumentActivity();
       aceSchedulePrompt();
     });
 
@@ -1368,51 +2710,22 @@
     aceWidget.addEventListener("pointercancel", aceHandlePointerUp);
 
     aceWidget.addEventListener("click", function (event) {
-      const projectButton = event.target.closest("[data-ace-project-id]");
-      if (projectButton && aceWidget.contains(projectButton)) {
-        aceChooseProject(projectButton.getAttribute("data-ace-project-id"));
-        return;
-      }
+      aceHandleWidgetDecision(event, "click");
+    }, true);
+    aceWidget.addEventListener("input", aceHandleWidgetInput, true);
 
-      const button = event.target.closest("[data-ace-action]");
-      if (!button || !aceWidget.contains(button)) {
-        return;
-      }
-      if (button.disabled) {
-        return;
-      }
+    window.addEventListener("pagehide", aceHandleDocumentExit);
+    window.addEventListener("beforeunload", aceHandleDocumentExit);
 
-      const action = button.getAttribute("data-ace-action");
+    aceRunAsync(aceRestoreSession(), "restore session");
+  }
 
-      if (action === "confirm-start") {
-        aceStartSession();
-      } else if (action === "decline-start") {
-        aceDeclineStart();
-      } else if (action === "end") {
-        aceEndSession();
-      } else if (action === "switch") {
-        aceSwitchSessionType();
-      } else if (action === "open") {
-        aceOpenApp();
-      } else if (action === "refresh-page") {
-        window.location.reload();
-      } else if (action === "retry-sync") {
-        if (aceCompletedSession?.projectId) {
-          aceSyncCompletedSession();
-        } else {
-          aceResolveAndSyncCompletedSession(false);
-        }
-      } else if (action === "change-project") {
-        if (aceCompletedSession) {
-          aceResolveAndSyncCompletedSession(true);
-        } else if (aceActiveSession) {
-          aceShowProjectPickerForActiveSession();
-        }
-      } else if (action === "start-new") {
-        aceStartNew();
-      }
-    });
+  function aceHandleDocumentExit() {
+    if (aceExitHandled || !aceActiveSession) {
+      return;
+    }
 
-    aceRestoreSession();
+    aceExitHandled = true;
+    aceRunAsync(aceEndSession({ fromUnload: true }), "auto-end session on document exit");
   }
 })();
