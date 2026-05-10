@@ -9,6 +9,8 @@
   const ACE_GOOGLE_DOC_POLL_DELAY_MS = 700;
   const ACE_GOOGLE_DOC_POLL_ATTEMPTS = 6;
   const ACE_ACTIVITY_MESSAGE = "ace-writing-activity";
+  const ACE_QUOTE_FIND_MESSAGE = "ace-find-quote";
+  const ACE_QUOTE_FIND_RESULT_MESSAGE = "ace-find-quote-result";
   const ACE_GOOGLE_DOC_WORD_COUNT_MESSAGE = "ace-google-doc-word-count";
   const ACE_GOOGLE_DOC_START_SNAPSHOT_MESSAGE = "ace-google-doc-start-snapshot";
   const ACE_GOOGLE_DOC_DIFF_MESSAGE = "ace-google-doc-diff";
@@ -1499,6 +1501,10 @@
     if (sentence?.[0]) {
       candidates.push(sentence[0]);
     }
+    const words = normalizedQuote.split(" ").filter(Boolean);
+    for (let index = 0; index < words.length; index += 6) {
+      candidates.push(words.slice(index, index + 12).join(" "));
+    }
 
     return [...new Set(candidates.map(aceNormalizeIssueNoteText))]
       .filter(function (candidate) {
@@ -1506,30 +1512,117 @@
       });
   }
 
-  async function aceFindQuoteInDocument(quote) {
+  function aceSelectionNode() {
+    const selection = window.getSelection ? window.getSelection() : null;
+    if (!selection?.rangeCount) {
+      return null;
+    }
+
+    const node = selection.getRangeAt(0).startContainer;
+    return node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+  }
+
+  function aceSelectionIsInWidget() {
+    const node = aceSelectionNode();
+    return Boolean(node && aceWidget?.contains(node));
+  }
+
+  function aceScrollSelectionIntoView() {
+    const node = aceSelectionNode();
+    if (!node || aceSelectionIsInWidget()) {
+      return false;
+    }
+
+    const target = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+    target?.scrollIntoView?.({ block: "center", inline: "nearest", behavior: "smooth" });
+    return true;
+  }
+
+  async function aceFindQuoteInCurrentFrame(quote) {
     if (!window.find) {
       return false;
     }
 
-    const previousDisplay = aceWidget.style.display;
-    const previousVisibility = aceWidget.style.visibility;
-    aceWidget.style.display = "none";
-    aceWidget.style.visibility = "hidden";
-    await aceNextFrame();
-
-    let found = false;
-    try {
-      document.activeElement?.blur?.();
-      window.getSelection?.().removeAllRanges?.();
-      found = aceQuoteSearchCandidates(quote).some(function (candidate) {
-        return Boolean(window.find(candidate, false, false, true, false, true, false));
-      });
-    } catch (_error) {
-      found = false;
+    document.activeElement?.blur?.();
+    for (const candidate of aceQuoteSearchCandidates(quote)) {
+      try {
+        window.getSelection?.().removeAllRanges?.();
+        const found = Boolean(window.find(candidate, false, false, true, false, false, false));
+        if (found && !aceSelectionIsInWidget()) {
+          await aceNextFrame();
+          aceScrollSelectionIntoView();
+          return true;
+        }
+      } catch (_error) {
+        // Try the next candidate.
+      }
     }
 
-    aceWidget.style.display = previousDisplay;
-    aceWidget.style.visibility = previousVisibility;
+    return false;
+  }
+
+  function aceFindQuoteInChildFrames(quote) {
+    if (!ACE_IS_TOP_FRAME || !window.frames?.length) {
+      return Promise.resolve(false);
+    }
+
+    const token = `ace-find-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return new Promise(function (resolve) {
+      let settled = false;
+      let pending = window.frames.length;
+
+      function finish(found) {
+        if (settled) {
+          return;
+        }
+
+        if (found || pending <= 0) {
+          settled = true;
+          window.removeEventListener("message", handleResult);
+          resolve(Boolean(found));
+        }
+      }
+
+      function handleResult(event) {
+        if (event.data?.aceType !== ACE_QUOTE_FIND_RESULT_MESSAGE || event.data.token !== token) {
+          return;
+        }
+
+        pending -= 1;
+        finish(Boolean(event.data.found));
+      }
+
+      window.addEventListener("message", handleResult);
+      for (let index = 0; index < window.frames.length; index += 1) {
+        try {
+          window.frames[index].postMessage({ aceType: ACE_QUOTE_FIND_MESSAGE, token, quote }, "*");
+        } catch (_error) {
+          pending -= 1;
+        }
+      }
+      window.setTimeout(function () {
+        pending = 0;
+        finish(false);
+      }, 1200);
+    });
+  }
+
+  async function aceFindQuoteInDocument(quote) {
+    const previousDisplay = aceWidget?.style.display || "";
+    const previousVisibility = aceWidget?.style.visibility || "";
+    if (aceWidget) {
+      aceWidget.style.display = "none";
+      aceWidget.style.visibility = "hidden";
+    }
+    await aceNextFrame();
+
+    const found = await aceFindQuoteInCurrentFrame(quote)
+      || await aceFindQuoteInChildFrames(quote);
+
+    if (aceWidget) {
+      aceWidget.style.display = previousDisplay;
+      aceWidget.style.visibility = previousVisibility;
+    }
     return found;
   }
 
@@ -1549,14 +1642,12 @@
     }
 
     const found = await aceFindQuoteInDocument(quote);
-    await aceCopyText(quote);
-    const shortcut = navigator.platform.toLowerCase().includes("mac") ? "Cmd+F" : "Ctrl+F";
     if (found) {
       aceMinimizeWidget();
       return;
     }
 
-    aceRenderIssuesList(`Quote copied. Press ${shortcut}, paste it, and Google Docs will jump to the passage.`);
+    aceRenderIssuesList("Could not jump to that quote. Make sure the quote text is still in this Google Doc.");
   }
 
   async function aceCheckCatchUpBeforeStartPrompt() {
@@ -2496,6 +2587,19 @@
     aceRegisterWritingActivity();
   }
 
+  async function aceHandleQuoteFindMessage(message) {
+    if (ACE_IS_TOP_FRAME || !message?.token) {
+      return;
+    }
+
+    const found = await aceFindQuoteInCurrentFrame(message.quote || "");
+    window.top.postMessage({
+      aceType: ACE_QUOTE_FIND_RESULT_MESSAGE,
+      token: message.token,
+      found
+    }, "*");
+  }
+
   function aceGetAnchorPoint(position) {
     const rect = aceWidget.getBoundingClientRect();
     const width = rect.width || 120;
@@ -2735,6 +2839,14 @@
   document.addEventListener("keydown", aceHandleKeydown, true);
   document.addEventListener("paste", aceHandleClipboardActivity, true);
   document.addEventListener("cut", aceHandleClipboardActivity, true);
+
+  window.addEventListener("message", function (event) {
+    if (event.data?.aceType !== ACE_QUOTE_FIND_MESSAGE) {
+      return;
+    }
+
+    aceRunAsync(aceHandleQuoteFindMessage(event.data), "find quote in document frame");
+  });
 
   if (ACE_IS_TOP_FRAME) {
     window.addEventListener("message", function (event) {
