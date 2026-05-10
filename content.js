@@ -347,43 +347,86 @@
     window.open(ACE_APP_URL, "_blank", "noopener,noreferrer");
   }
 
-  async function aceApiFetch(path, options) {
-    const response = await new Promise(function (resolve, reject) {
+  function aceIsExtensionContextError(error) {
+    const message = String(error?.message || error || "").toLowerCase();
+    return message.includes("extension context")
+      || message.includes("context invalidated")
+      || message.includes("message port closed")
+      || message.includes("receiving end does not exist");
+  }
+
+  async function aceDirectApiFetch(path, options) {
+    if (!path.startsWith("/api/")) {
+      throw new Error("Invalid Author Companion API path.");
+    }
+
+    const response = await fetch(`${ACE_API_BASE_URL}${path}`, {
+      method: options?.method || "GET",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        ...(options?.headers || {})
+      },
+      body: options?.body || undefined
+    });
+    const text = await response.text();
+    let payload = {};
+    if (text) {
+      try {
+        payload = JSON.parse(text);
+      } catch (_error) {
+        payload = { raw: text };
+      }
+    }
+
+    if (!response.ok) {
+      throw new Error(payload.error || response.statusText || "Author Companion API request failed.");
+    }
+    return payload;
+  }
+
+  async function aceApiFetchViaRuntime(path, options) {
+    return new Promise(function (resolve, reject) {
       const runtime = aceChromeRuntime();
       if (!runtime?.runtime?.sendMessage) {
         reject(new Error("Extension context is not available. Refresh the Google Doc."));
         return;
       }
 
-      try {
-        runtime.runtime.sendMessage(
-          {
-            aceType: "ace-api-fetch",
-            path,
-            options: {
-              method: options?.method || "GET",
-              headers: options?.headers || {},
-              body: options?.body || ""
-            }
-          },
-          function (messageResponse) {
-            if (runtime.runtime.lastError) {
-              reject(new Error(runtime.runtime.lastError.message));
-              return;
-            }
-
-            resolve(messageResponse || {});
+      runtime.runtime.sendMessage(
+        {
+          aceType: "ace-api-fetch",
+          path,
+          options: {
+            method: options?.method || "GET",
+            headers: options?.headers || {},
+            body: options?.body || ""
           }
-        );
-      } catch (error) {
-        reject(error);
-      }
+        },
+        function (messageResponse) {
+          if (runtime.runtime.lastError) {
+            reject(new Error(runtime.runtime.lastError.message));
+            return;
+          }
+          resolve(messageResponse || {});
+        }
+      );
     });
+  }
 
+  async function aceApiFetch(path, options) {
+    let response = {};
+    try {
+      response = await aceApiFetchViaRuntime(path, options);
+    } catch (error) {
+      if (aceIsExtensionContextError(error)) {
+        return aceDirectApiFetch(path, options);
+      }
+      throw error;
+    }
     if (!response.ok) {
       throw new Error(response.error || "Author Companion API request failed.");
     }
-
     return response.payload || {};
   }
 
