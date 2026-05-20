@@ -9,11 +9,13 @@
   const ACE_GOOGLE_DOC_POLL_DELAY_MS = 700;
   const ACE_GOOGLE_DOC_POLL_ATTEMPTS = 6;
   const ACE_ACTIVITY_MESSAGE = "ace-writing-activity";
-  const ACE_QUOTE_FIND_MESSAGE = "ace-find-quote";
-  const ACE_QUOTE_FIND_RESULT_MESSAGE = "ace-find-quote-result";
+  const ACE_VISIBLE_WORD_COUNT_MESSAGE = "ace-visible-word-count";
+  const ACE_VISIBLE_WORD_COUNT_RESULT_MESSAGE = "ace-visible-word-count-result";
   const ACE_GOOGLE_DOC_WORD_COUNT_MESSAGE = "ace-google-doc-word-count";
   const ACE_GOOGLE_DOC_START_SNAPSHOT_MESSAGE = "ace-google-doc-start-snapshot";
   const ACE_GOOGLE_DOC_DIFF_MESSAGE = "ace-google-doc-diff";
+  const ACE_WORD_SNAPSHOT_STORAGE_PREFIX = "aceWordSnapshot:";
+  const ACE_AUTO_START_UNBOUND_RECHECK_MS = 30000;
   const ACE_IS_TOP_FRAME = window.top === window;
   const ACE_ISSUE_TITLE_WORD_LIMIT = 8;
 
@@ -25,7 +27,8 @@
     activeSession: "aceActiveSession",
     pendingSessions: "acePendingSessions",
     documentBindings: "aceDocumentBindings",
-    documentBaselines: "aceDocumentBaselines"
+    documentBaselines: "aceDocumentBaselines",
+    lastSessionType: "aceLastSessionType"
   };
 
   const ACE_DEFAULT_POSITION = "middle-right";
@@ -134,6 +137,8 @@
   let aceIssueReturnState = "idle";
   let aceCurrentIssues = [];
   let aceIssueStatus = "";
+  let aceAutoStartInFlight = false;
+  let aceAutoStartBindingMisses = {};
 
   if (ACE_IS_TOP_FRAME) {
     if (document.getElementById(ACE_WIDGET_ID)) {
@@ -224,6 +229,10 @@
     return value.charAt(0).toUpperCase() + value.slice(1);
   }
 
+  function aceNormalizeSessionType(value) {
+    return value === "editing" ? "editing" : "writing";
+  }
+
   function aceExtractDocumentId() {
     const match = window.location.pathname.match(/\/document\/d\/([^/]+)/);
     return match ? decodeURIComponent(match[1]) : "";
@@ -236,6 +245,10 @@
   function aceCreateExtensionSessionId(documentId) {
     const random = Math.random().toString(36).slice(2, 10);
     return `ace-${documentId || "doc"}-${Date.now()}-${random}`;
+  }
+
+  function aceSnapshotStorageKey(extensionSessionId) {
+    return `${ACE_WORD_SNAPSHOT_STORAGE_PREFIX}${extensionSessionId}`;
   }
 
   function aceCreateExtensionIssueId(documentId) {
@@ -345,8 +358,16 @@
     return `${words} word${words === 1 ? "" : "s"}`;
   }
 
+  function aceFormatNumber(count) {
+    return Math.max(0, Number(count) || 0).toLocaleString("en-US");
+  }
+
   function aceOpenApp() {
     window.open(ACE_APP_URL, "_blank", "noopener,noreferrer");
+  }
+
+  function aceOpenEditDashboard() {
+    window.open(`${ACE_APP_URL}/?view=edit`, "_blank", "noopener,noreferrer");
   }
 
   function aceIsExtensionContextError(error) {
@@ -359,7 +380,7 @@
 
   async function aceDirectApiFetch(path, options) {
     if (!path.startsWith("/api/")) {
-      throw new Error("Invalid Author Companion API path.");
+      throw new Error("Invalid Scriptor API path.");
     }
 
     const response = await fetch(`${ACE_API_BASE_URL}${path}`, {
@@ -382,7 +403,7 @@
     }
 
     if (!response.ok) {
-      throw new Error(payload.error || response.statusText || "Author Companion API request failed.");
+      throw new Error(payload.error || response.statusText || "Scriptor API request failed.");
     }
     return payload;
   }
@@ -427,7 +448,7 @@
       throw error;
     }
     if (!response.ok) {
-      throw new Error(response.error || "Author Companion API request failed.");
+      throw new Error(response.error || "Scriptor API request failed.");
     }
     return response.payload || {};
   }
@@ -442,6 +463,18 @@
       method: "PUT",
       body: JSON.stringify({ documentId, projectId })
     });
+  }
+
+  async function aceGetServerDocumentBinding(documentId) {
+    if (!documentId) {
+      return null;
+    }
+    try {
+      const payload = await aceApiFetch(`/api/extension/document-binding?documentId=${encodeURIComponent(documentId)}`);
+      return payload?.project || null;
+    } catch (_error) {
+      return null;
+    }
   }
 
   async function aceLocalDocumentBindings() {
@@ -479,6 +512,35 @@
     });
   }
 
+  async function aceGetBoundProjectForDocument(documentId) {
+    if (!documentId) {
+      return null;
+    }
+
+    const localBinding = await aceGetLocalDocumentBinding(documentId);
+    if (localBinding?.projectId) {
+      return localBinding;
+    }
+
+    const miss = aceAutoStartBindingMisses[documentId];
+    if (miss && Date.now() - miss < ACE_AUTO_START_UNBOUND_RECHECK_MS) {
+      return null;
+    }
+
+    const serverProject = await aceGetServerDocumentBinding(documentId);
+    if (serverProject?.id) {
+      await aceSaveLocalDocumentBinding(documentId, serverProject);
+      delete aceAutoStartBindingMisses[documentId];
+      return {
+        projectId: serverProject.id,
+        project: serverProject
+      };
+    }
+
+    aceAutoStartBindingMisses[documentId] = Date.now();
+    return null;
+  }
+
   async function aceLocalDocumentBaselines() {
     const stored = await aceStorageGet(ACE_LOCAL_STORAGE.documentBaselines);
     const baselines = stored[ACE_LOCAL_STORAGE.documentBaselines];
@@ -513,6 +575,8 @@
           projectId,
           project: project || null,
           endDocumentWordCount: Math.max(0, endWordCount),
+          endDocumentWordCounts: session?.endDocumentWordCounts || session?.endWordCounts || null,
+          revisionId: session?.endDocumentRevisionId || session?.revisionId || "",
           syncedAt: new Date().toISOString(),
           sessionId: session.extensionSessionId || ""
         }
@@ -556,7 +620,7 @@
     const measuredNetWordsChanged = Number.isFinite(startDocumentWordCount) && Number.isFinite(endDocumentWordCount)
       ? endDocumentWordCount - startDocumentWordCount
       : Number(session?.netWordsChanged) || 0;
-    const editingBreakdown = aceEditingBreakdownForSync(session, measuredNetWordsChanged);
+    const wordChangeBreakdown = aceWordChangeBreakdownForSync(session, measuredNetWordsChanged);
 
     return {
       ...session,
@@ -564,9 +628,9 @@
       wordsWritten: sessionType === "writing"
         ? Math.max(0, Number(session?.wordsWritten) || measuredNetWordsChanged)
         : 0,
-      wordsAdded: sessionType === "editing" ? editingBreakdown.wordsAdded : 0,
-      wordsRemoved: sessionType === "editing" ? editingBreakdown.wordsRemoved : 0,
-      wordsEdited: sessionType === "editing" ? editingBreakdown.wordsEdited : 0,
+      wordsAdded: wordChangeBreakdown.wordsAdded,
+      wordsRemoved: wordChangeBreakdown.wordsRemoved,
+      wordsEdited: sessionType === "editing" ? wordChangeBreakdown.wordsEdited : 0,
       netWordsChanged: measuredNetWordsChanged,
       startDocumentWordCount,
       endDocumentWordCount,
@@ -575,7 +639,7 @@
     };
   }
 
-  function aceEditingBreakdownForSync(session, netWordsChanged) {
+  function aceWordChangeBreakdownForSync(session, netWordsChanged) {
     const explicitWordsAdded = Math.max(0, Number(session?.wordsAdded) || 0);
     const explicitWordsRemoved = Math.max(0, Number(session?.wordsRemoved) || 0);
     if (explicitWordsAdded || explicitWordsRemoved) {
@@ -589,8 +653,8 @@
     const wordsEdited = Math.max(0, Number(session?.wordsEdited) || 0);
     if (!wordsEdited) {
       return {
-        wordsAdded: 0,
-        wordsRemoved: 0,
+        wordsAdded: Math.max(0, Number(netWordsChanged) || 0),
+        wordsRemoved: Math.max(0, -(Number(netWordsChanged) || 0)),
         wordsEdited: 0
       };
     }
@@ -661,7 +725,12 @@
       }
     });
 
-    const wordCount = Number(response.wordCount);
+    const visibleWordCount = await aceVisibleGoogleDocWordCount();
+    const responseWordCount = Number(response.wordCount);
+    const wordCount = Number.isFinite(visibleWordCount) ? visibleWordCount : responseWordCount;
+    const trustedApiWordCounts = !Number.isFinite(visibleWordCount)
+      || !Number.isFinite(responseWordCount)
+      || Math.max(0, visibleWordCount) === Math.max(0, responseWordCount);
     const wordsAdded = Number(response.wordsAdded);
     const wordsRemoved = Number(response.wordsRemoved);
     const netWordsChanged = Number(response.netWordsChanged);
@@ -670,10 +739,245 @@
       revisionId: response.revisionId || "",
       startRevisionId: response.startRevisionId || "",
       wordCount: Number.isFinite(wordCount) ? Math.max(0, wordCount) : null,
+      apiWordCount: Number.isFinite(responseWordCount) ? Math.max(0, responseWordCount) : null,
+      visibleWordCount: Number.isFinite(visibleWordCount) ? Math.max(0, visibleWordCount) : null,
+      wordCounts: trustedApiWordCounts ? response.wordCounts || null : null,
+      endWordCounts: trustedApiWordCounts ? response.endWordCounts || null : null,
       wordsAdded: Number.isFinite(wordsAdded) ? Math.max(0, wordsAdded) : 0,
       wordsRemoved: Number.isFinite(wordsRemoved) ? Math.max(0, wordsRemoved) : 0,
       netWordsChanged: Number.isFinite(netWordsChanged) ? netWordsChanged : 0
     };
+  }
+
+  async function aceVisibleGoogleDocWordCount() {
+    const localCount = aceVisibleGoogleDocWordCountLocal();
+    const frameCount = ACE_IS_TOP_FRAME
+      ? await aceVisibleGoogleDocWordCountFromFrames()
+      : null;
+    if (Number.isFinite(frameCount)) {
+      return frameCount;
+    }
+    return Number.isFinite(localCount) ? localCount : null;
+  }
+
+  function aceVisibleGoogleDocWordCountLocal() {
+    const candidates = [];
+    const visitedWindows = new Set();
+
+    function collectFromWindow(targetWindow, depth = 0) {
+      if (!targetWindow || visitedWindows.has(targetWindow) || depth > 4) {
+        return;
+      }
+
+      visitedWindows.add(targetWindow);
+      try {
+        aceVisibleWordCountCandidatesInDocument(targetWindow.document, targetWindow).forEach(function (candidate) {
+          candidates.push(candidate);
+        });
+
+        for (let index = 0; index < targetWindow.frames.length; index += 1) {
+          collectFromWindow(targetWindow.frames[index], depth + 1);
+        }
+      } catch (_error) {
+        // Some Google Docs frames are not readable from this content script.
+      }
+    }
+
+    collectFromWindow(window.top || window);
+    collectFromWindow(window);
+
+    return aceBestVisibleWordCountCandidate(candidates)?.count ?? null;
+  }
+
+  function aceVisibleGoogleDocWordCountFromFrames() {
+    if (!ACE_IS_TOP_FRAME || !window.frames?.length) {
+      return Promise.resolve(null);
+    }
+
+    const token = `ace-word-count-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return new Promise(function (resolve) {
+      const results = [];
+      let pending = window.frames.length;
+      let settled = false;
+
+      function finish() {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.removeEventListener("message", handleResult);
+        const best = aceBestVisibleWordCountCandidate(results);
+        resolve(Number.isFinite(best?.count) ? best.count : null);
+      }
+
+      function handleResult(event) {
+        if (event.data?.aceType !== ACE_VISIBLE_WORD_COUNT_RESULT_MESSAGE || event.data.token !== token) {
+          return;
+        }
+
+        const candidate = event.data.wordCountCandidate || null;
+        const count = Number(candidate?.count ?? event.data.wordCount);
+        if (Number.isFinite(count)) {
+          results.push({
+            count: Math.max(0, count),
+            score: Number(candidate?.score) || 0,
+            bottom: Number(candidate?.bottom) || 0,
+            left: Number(candidate?.left) || 0
+          });
+        }
+        pending -= 1;
+        if (pending <= 0) {
+          finish();
+        }
+      }
+
+      window.addEventListener("message", handleResult);
+      for (let index = 0; index < window.frames.length; index += 1) {
+        try {
+          window.frames[index].postMessage({ aceType: ACE_VISIBLE_WORD_COUNT_MESSAGE, token }, "*");
+        } catch (_error) {
+          pending -= 1;
+        }
+      }
+
+      if (pending <= 0) {
+        finish();
+        return;
+      }
+
+      window.setTimeout(finish, 900);
+    });
+  }
+
+  function aceHandleVisibleWordCountMessage(message, source) {
+    if (!message?.token || !source?.postMessage) {
+      return;
+    }
+
+    const wordCountCandidate = aceVisibleGoogleDocWordCountCandidateLocal();
+    source.postMessage({
+      aceType: ACE_VISIBLE_WORD_COUNT_RESULT_MESSAGE,
+      token: message.token,
+      wordCount: Number.isFinite(wordCountCandidate?.count) ? wordCountCandidate.count : null,
+      wordCountCandidate
+    }, "*");
+  }
+
+  function aceVisibleGoogleDocWordCountCandidateLocal() {
+    const candidates = [];
+    const visitedWindows = new Set();
+
+    function collectFromWindow(targetWindow, depth = 0) {
+      if (!targetWindow || visitedWindows.has(targetWindow) || depth > 4) {
+        return;
+      }
+
+      visitedWindows.add(targetWindow);
+      try {
+        aceVisibleWordCountCandidatesInDocument(targetWindow.document, targetWindow).forEach(function (candidate) {
+          candidates.push(candidate);
+        });
+
+        for (let index = 0; index < targetWindow.frames.length; index += 1) {
+          collectFromWindow(targetWindow.frames[index], depth + 1);
+        }
+      } catch (_error) {
+        // Some Google Docs frames are not readable from this content script.
+      }
+    }
+
+    collectFromWindow(window.top || window);
+    collectFromWindow(window);
+
+    return aceBestVisibleWordCountCandidate(candidates);
+  }
+
+  function aceBestVisibleWordCountCandidate(candidates) {
+    return (candidates || [])
+      .filter(function (candidate) {
+        return candidate && Number.isFinite(candidate.count);
+      })
+      .sort(function (a, b) {
+        return (Number(b.score) || 0) - (Number(a.score) || 0)
+          || (Number(b.bottom) || 0) - (Number(a.bottom) || 0)
+          || (Number(a.left) || 0) - (Number(b.left) || 0);
+      })[0] || null;
+  }
+
+  function aceVisibleWordCountCandidatesInDocument(targetDocument, targetWindow) {
+    if (!targetDocument || !targetWindow) {
+      return [];
+    }
+
+    return Array.from(targetDocument.querySelectorAll("div, span, button, [aria-label], [role='button']"))
+      .map(function (element) {
+        if (element.closest?.("#ace-widget")) {
+          return null;
+        }
+
+        const count = aceVisibleWordCountFromElement(element);
+        if (!Number.isFinite(count)) {
+          return null;
+        }
+
+        const rect = element.getBoundingClientRect();
+        const viewportWidth = targetWindow.innerWidth || targetDocument.documentElement?.clientWidth || 0;
+        const viewportHeight = targetWindow.innerHeight || targetDocument.documentElement?.clientHeight || 0;
+        const isVisible = rect.width > 0
+          && rect.height > 0
+          && rect.bottom >= 0
+          && rect.right >= 0
+          && rect.top <= viewportHeight
+          && rect.left <= viewportWidth;
+        if (!isVisible) {
+          return null;
+        }
+
+        const isBottomLeftCounter = rect.left <= Math.min(360, viewportWidth * 0.4)
+          && rect.top >= viewportHeight * 0.55
+          && rect.bottom >= viewportHeight * 0.65;
+        if (!isBottomLeftCounter) {
+          return null;
+        }
+
+        return {
+          count,
+          bottom: rect.bottom,
+          left: rect.left,
+          score: (viewportHeight ? rect.bottom / viewportHeight : 0)
+            + (viewportWidth ? (1 - rect.left / viewportWidth) : 0)
+        };
+      })
+      .filter(function (candidate) {
+        return candidate && Number.isFinite(candidate.count);
+      });
+  }
+
+  function aceVisibleWordCountFromElement(element) {
+    const texts = [
+      element.textContent || "",
+      element.getAttribute?.("aria-label") || "",
+      element.getAttribute?.("title") || ""
+    ];
+
+    for (const rawText of texts) {
+      const text = aceNormalizeIssueNoteText(rawText);
+      if (!text || text.length > 120) {
+        continue;
+      }
+
+      const match = text.match(/(?:^|[^\p{L}\p{N}])([\d,]+)\s+words?(?:[^\p{L}\p{N}]|$)/iu);
+      if (!match) {
+        continue;
+      }
+
+      const count = Number(match[1].replace(/,/g, ""));
+      if (Number.isFinite(count)) {
+        return Math.max(0, count);
+      }
+    }
+
+    return null;
   }
 
   async function aceGoogleDocStartSnapshot(documentId, extensionSessionId, interactive) {
@@ -690,6 +994,33 @@
       extensionSessionId,
       interactive: Boolean(interactive)
     });
+  }
+
+  async function aceSeedGoogleDocStartSnapshotFromBaseline(documentId, extensionSessionId, baseline) {
+    const wordCount = aceOptionalWordCount(baseline?.endDocumentWordCount);
+    const wordCounts = baseline?.endDocumentWordCounts || baseline?.wordCounts || null;
+    if (!documentId || !extensionSessionId || !Number.isFinite(wordCount) || !wordCounts) {
+      return null;
+    }
+
+    await aceStorageSet({
+      [aceSnapshotStorageKey(extensionSessionId)]: {
+        documentId,
+        revisionId: baseline.revisionId || "",
+        wordCount,
+        wordCounts,
+        createdAt: new Date().toISOString()
+      }
+    });
+
+    return {
+      ok: true,
+      status: 200,
+      method: "local-baseline",
+      revisionId: baseline.revisionId || "",
+      wordCount,
+      wordCounts
+    };
   }
 
   async function aceGoogleDocWordCount(documentId, interactive) {
@@ -752,11 +1083,34 @@
       if (!response.ok || !Number.isFinite(response.wordCount)) {
         bestResponse = response;
       } else {
+        const suspiciousZeroWordCount = Number(startWordCount) >= 100
+          && Number(response.apiWordCount) === 0
+          && !Number.isFinite(response.visibleWordCount);
+        if (suspiciousZeroWordCount) {
+          bestResponse = {
+            ...response,
+            ok: false,
+            wordCount: null,
+            wordsAdded: 0,
+            wordsRemoved: 0,
+            netWordsChanged: 0,
+            error: "Google Docs returned 0 words, so I did not trust the automatic count. Retry after Google Docs updates its word count."
+          };
+          continue;
+        }
+
         const delta = Number.isFinite(startWordCount)
           ? response.wordCount - startWordCount
           : 0;
-        const wordsAdded = Math.max(0, Number(response.wordsAdded) || 0);
-        const wordsRemoved = Math.max(0, Number(response.wordsRemoved) || 0);
+        const trustedApiDiff = !Number.isFinite(response.visibleWordCount)
+          || !Number.isFinite(response.apiWordCount)
+          || Math.max(0, response.visibleWordCount) === Math.max(0, response.apiWordCount);
+        const wordsAdded = trustedApiDiff
+          ? Math.max(0, Number(response.wordsAdded) || 0)
+          : Math.max(0, delta);
+        const wordsRemoved = trustedApiDiff
+          ? Math.max(0, Number(response.wordsRemoved) || 0)
+          : Math.max(0, -delta);
         const totalActivity = wordsAdded + wordsRemoved;
         const netMagnitude = Math.abs(delta);
         const revisionChanged = Boolean(
@@ -768,8 +1122,15 @@
           || totalActivity > bestActivity
           || (totalActivity === bestActivity && netMagnitude > bestNetMagnitude);
 
+        const measuredResponse = {
+          ...response,
+          wordsAdded,
+          wordsRemoved,
+          netWordsChanged: delta
+        };
+
         if (isBetterResponse) {
-          bestResponse = response;
+          bestResponse = measuredResponse;
           bestActivity = totalActivity;
           bestNetMagnitude = netMagnitude;
           bestAttempt = attempt + 1;
@@ -785,7 +1146,7 @@
             wordsRemoved,
             netWordsChanged: delta
           });
-          return response;
+          return measuredResponse;
         }
       }
 
@@ -818,6 +1179,130 @@
     return bestResponse;
   }
 
+  function aceCompareWordCounts(startWordCounts, endWordCounts, netWordsChanged) {
+    if (!startWordCounts || !endWordCounts) {
+      return {
+        wordsAdded: Math.max(0, Number(netWordsChanged) || 0),
+        wordsRemoved: Math.max(0, -(Number(netWordsChanged) || 0))
+      };
+    }
+
+    const keys = new Set([
+      ...Object.keys(startWordCounts || {}),
+      ...Object.keys(endWordCounts || {})
+    ]);
+    let wordsAdded = 0;
+    let wordsRemoved = 0;
+    keys.forEach(function (key) {
+      const startCount = Math.max(0, Number(startWordCounts[key]) || 0);
+      const endCount = Math.max(0, Number(endWordCounts[key]) || 0);
+      if (endCount > startCount) {
+        wordsAdded += endCount - startCount;
+      } else if (startCount > endCount) {
+        wordsRemoved += startCount - endCount;
+      }
+    });
+    return { wordsAdded, wordsRemoved };
+  }
+
+  function aceWordCountsSignature(wordCounts) {
+    if (!wordCounts || typeof wordCounts !== "object") {
+      return "";
+    }
+
+    return Object.keys(wordCounts)
+      .sort()
+      .map(function (key) {
+        return `${key}:${Math.max(0, Number(wordCounts[key]) || 0)}`;
+      })
+      .join("|");
+  }
+
+  async function aceGoogleDocWordCountAfterSettle(documentId, baseline) {
+    await aceDelay(ACE_GOOGLE_DOC_SETTLE_DELAY_MS);
+
+    const baselineWordCount = Math.max(0, Number(baseline?.endDocumentWordCount) || 0);
+    const baselineWordCounts = baseline?.endDocumentWordCounts || baseline?.wordCounts || null;
+    let bestResponse = {
+      ok: false,
+      wordCount: null,
+      revisionId: "",
+      wordsAdded: 0,
+      wordsRemoved: 0,
+      netWordsChanged: 0,
+      error: ""
+    };
+    let bestActivity = Number.NEGATIVE_INFINITY;
+    let bestNetMagnitude = Number.NEGATIVE_INFINITY;
+    let previousSignature = "";
+    let stableSnapshots = 0;
+
+    for (let attempt = 0; attempt < ACE_GOOGLE_DOC_POLL_ATTEMPTS; attempt += 1) {
+      const response = await aceGoogleDocWordCount(documentId, attempt === 0);
+      const wordCount = Number(response.wordCount);
+      if (!response.ok || !Number.isFinite(wordCount)) {
+        bestResponse = response;
+      } else {
+        const delta = wordCount - baselineWordCount;
+        const diff = aceCompareWordCounts(baselineWordCounts, response.wordCounts, delta);
+        const enrichedResponse = {
+          ...response,
+          wordsAdded: diff.wordsAdded,
+          wordsRemoved: diff.wordsRemoved,
+          netWordsChanged: delta
+        };
+        const totalActivity = diff.wordsAdded + diff.wordsRemoved;
+        const netMagnitude = Math.abs(delta);
+        const isBetterResponse = !bestResponse.ok
+          || totalActivity > bestActivity
+          || (totalActivity === bestActivity && netMagnitude > bestNetMagnitude);
+
+        if (isBetterResponse) {
+          bestResponse = enrichedResponse;
+          bestActivity = totalActivity;
+          bestNetMagnitude = netMagnitude;
+        }
+
+        const signature = [
+          response.revisionId || "",
+          wordCount,
+          aceWordCountsSignature(response.wordCounts)
+        ].join("::");
+        stableSnapshots = signature && signature === previousSignature
+          ? stableSnapshots + 1
+          : 0;
+        previousSignature = signature;
+
+        if (stableSnapshots >= 1) {
+          console.info("[ACE] Selected stable Google Docs catch-up word count", {
+            attempt: attempt + 1,
+            baselineWordCount,
+            currentWordCount: bestResponse.wordCount,
+            wordsAdded: bestResponse.wordsAdded,
+            wordsRemoved: bestResponse.wordsRemoved,
+            netWordsChanged: bestResponse.netWordsChanged
+          });
+          return bestResponse;
+        }
+      }
+
+      if (attempt < ACE_GOOGLE_DOC_POLL_ATTEMPTS - 1) {
+        await aceDelay(ACE_GOOGLE_DOC_POLL_DELAY_MS);
+      }
+    }
+
+    console.info("[ACE] Selected Google Docs catch-up word count", {
+      baselineWordCount,
+      currentWordCount: bestResponse.wordCount,
+      wordsAdded: Math.max(0, Number(bestResponse.wordsAdded) || 0),
+      wordsRemoved: Math.max(0, Number(bestResponse.wordsRemoved) || 0),
+      netWordsChanged: Number.isFinite(Number(bestResponse.netWordsChanged))
+        ? Number(bestResponse.netWordsChanged)
+        : 0
+    });
+    return bestResponse;
+  }
+
   function aceClearActivityTimers() {
     // Writing activity no longer schedules an automatic start prompt.
   }
@@ -836,6 +1321,17 @@
     }
 
     await aceStorageSet({ [ACE_LOCAL_STORAGE.activeSession]: aceActiveSession });
+  }
+
+  async function aceLastSessionType() {
+    const stored = await aceStorageGet(ACE_LOCAL_STORAGE.lastSessionType);
+    return aceNormalizeSessionType(stored[ACE_LOCAL_STORAGE.lastSessionType]);
+  }
+
+  async function aceRememberLastSessionType(sessionType) {
+    await aceStorageSet({
+      [ACE_LOCAL_STORAGE.lastSessionType]: aceNormalizeSessionType(sessionType)
+    });
   }
 
   async function acePendingSessions() {
@@ -874,6 +1370,7 @@
       : "";
     aceWidget.className = "ace-widget ace-widget--loading";
     aceWidget.innerHTML = `
+      ${acePanelHeaderHtml("Scriptor", "Working")}
       <div class="ace-loading-line">
         <span class="ace-spinner" aria-hidden="true"></span>
         <span>${aceEscapeHtml(message)}</span>
@@ -886,7 +1383,7 @@
   function aceRenderIdle() {
     aceWidget.className = "ace-widget ace-widget--idle";
     aceWidget.innerHTML = `
-      <button class="ace-icon-button" type="button" data-ace-action="show-controls" aria-label="Open Author Companion session controls">
+      <button class="ace-icon-button" type="button" data-ace-action="show-controls" aria-label="Open Scriptor session controls">
         <svg class="ace-pencil-icon" viewBox="0 0 24 24" aria-hidden="true">
           <path d="M4 20h4.2L19.4 8.8a2.1 2.1 0 0 0 0-3L18.2 4.6a2.1 2.1 0 0 0-3 0L4 15.8V20z"></path>
           <path d="M13.8 6 18 10.2"></path>
@@ -903,7 +1400,8 @@
     aceWidget.className = "ace-widget ace-widget--prompt";
     aceWidget.innerHTML = `
       ${aceCloseButtonHtml()}
-      <div class="ace-prompt-copy">Start session?</div>
+      ${acePanelHeaderHtml("Scriptor", "Google Docs")}
+      <div class="ace-prompt-copy">Start a Scriptor session for this doc?</div>
       ${errorCopy}
       <div class="ace-actions">
         <button class="ace-button ace-button--primary" type="button" data-ace-action="confirm-start">Yes</button>
@@ -916,22 +1414,129 @@
   }
 
   function aceRenderCatchUpPrompt() {
-    const words = Math.max(0, Number(aceCatchUpCandidate?.wordsWritten) || 0);
+    const activity = aceCatchUpActivity(aceCatchUpCandidate);
+    const startWordCount = Math.max(0, Number(aceCatchUpCandidate?.startDocumentWordCount) || 0);
+    const endWordCount = aceOptionalWordCount(aceCatchUpCandidate?.endDocumentWordCount);
+    const needsWordCountConfirmation = Boolean(aceCatchUpCandidate?.needsWordCountConfirmation)
+      || !Number.isFinite(endWordCount);
+    const promptCopy = needsWordCountConfirmation
+      ? "Google Docs returned 0 words, so I do not trust the automatic count. Enter the current word count shown in Google Docs to log catch-up."
+      : `I think this doc is at <span data-ace-current-word-count-preview>${aceFormatNumber(endWordCount)}</span> words now. Log catch-up?`;
+    const changeCopy = needsWordCountConfirmation
+      ? "Detected change: <span data-ace-catch-up-preview>enter a count to calculate changes</span>."
+      : `Detected change: <span data-ace-catch-up-preview>${activity.activityCopy}</span>.`;
+    const sessionTypeCopy = needsWordCountConfirmation
+      ? "catch-up"
+      : `catch-up ${activity.isEditingCatchUp ? "editing" : "writing"}`;
     const statusCopy = aceSyncStatus
       ? `<div class="ace-sync-copy ace-sync-copy--${aceSyncStatus}">${aceEscapeHtml(aceSyncMessage)}</div>`
       : "";
     aceWidget.className = "ace-widget ace-widget--catch-up";
     aceWidget.innerHTML = `
       ${aceCloseButtonHtml()}
-      <div class="ace-prompt-copy">Looks like ${aceFormatWords(words)} were added since your last session. Add them?</div>
-      <div class="ace-project-copy">This creates a 1 min catch-up writing session.</div>
+      ${acePanelHeaderHtml("Catch-up", "Scriptor")}
+      <div class="ace-prompt-copy">${promptCopy}</div>
+      <div class="ace-project-copy">Scriptor starts from ${aceFormatNumber(startWordCount)} words. ${changeCopy}</div>
+      <label class="ace-field ace-field--compact">
+        <span>Current word count</span>
+        <input type="text" inputmode="numeric" autocomplete="off" data-ace-catch-up-word-count value="${Number.isFinite(endWordCount) ? aceEscapeHtml(aceFormatNumber(endWordCount)) : ""}">
+      </label>
+      <div class="ace-project-copy">Change the count if Google Docs shows something different. This creates a 1 min ${sessionTypeCopy} session.</div>
       ${statusCopy}
       <div class="ace-actions">
-        <button class="ace-button ace-button--primary" type="button" data-ace-action="add-catch-up">Add missed words</button>
+        <button class="ace-button ace-button--primary" type="button" data-ace-action="add-catch-up">Log catch-up</button>
         <button class="ace-button" type="button" data-ace-action="skip-catch-up">Skip</button>
       </div>
     `;
     aceApplyWidgetPosition();
+  }
+
+  function aceCatchUpActivity(candidate) {
+    const wordsAdded = Math.max(0, Number(candidate?.wordsAdded) || 0);
+    const wordsRemoved = Math.max(0, Number(candidate?.wordsRemoved) || 0);
+    const totalWords = wordsAdded + wordsRemoved;
+    const isEditingCatchUp = candidate?.sessionType === "editing";
+    const activityCopy = isEditingCatchUp
+      ? wordsAdded > 0 && wordsRemoved > 0
+        ? `${aceFormatWords(wordsAdded)} added and ${aceFormatWords(wordsRemoved)} removed`
+        : `${aceFormatWords(wordsRemoved)} removed`
+      : `${aceFormatWords(wordsAdded)} added`;
+
+    return {
+      wordsAdded,
+      wordsRemoved,
+      totalWords,
+      isEditingCatchUp,
+      activityCopy,
+      verb: totalWords === 1 ? "was" : "were"
+    };
+  }
+
+  function aceParseWordCountInput(value) {
+    const normalized = String(value || "").replace(/,/g, "").trim();
+    if (!/^\d+$/.test(normalized)) {
+      return null;
+    }
+
+    const wordCount = Number(normalized);
+    return Number.isFinite(wordCount) ? Math.max(0, Math.round(wordCount)) : null;
+  }
+
+  function aceOptionalWordCount(value) {
+    if (value === null || value === undefined || value === "") {
+      return null;
+    }
+
+    const wordCount = Number(value);
+    return Number.isFinite(wordCount) ? Math.max(0, Math.round(wordCount)) : null;
+  }
+
+  function aceReadCatchUpEndWordCount() {
+    const input = aceWidget.querySelector("[data-ace-catch-up-word-count]");
+    if (!input) {
+      return aceOptionalWordCount(aceCatchUpCandidate?.endDocumentWordCount);
+    }
+
+    return aceParseWordCountInput(input.value);
+  }
+
+  function aceRecalculateCatchUpCandidate(candidate, endWordCount) {
+    const startWordCount = Math.max(0, Number(candidate?.startDocumentWordCount) || 0);
+    const currentWordCount = Math.max(0, Number(endWordCount) || 0);
+    const netWordsChanged = currentWordCount - startWordCount;
+    const wordsAdded = Math.max(0, netWordsChanged);
+    const wordsRemoved = Math.max(0, -netWordsChanged);
+    const sessionType = wordsRemoved > 0 ? "editing" : "writing";
+
+    return {
+      ...candidate,
+      currentSnapshot: {
+        ...(candidate?.currentSnapshot || {}),
+        wordCount: currentWordCount,
+        wordsAdded,
+        wordsRemoved,
+        netWordsChanged
+      },
+      endDocumentWordCount: currentWordCount,
+      endDocumentWordCounts: null,
+      wordsWritten: wordsRemoved > 0 ? 0 : wordsAdded,
+      wordsAdded,
+      wordsRemoved,
+      wordsEdited: wordsAdded + wordsRemoved,
+      netWordsChanged,
+      sessionType,
+      needsWordCountConfirmation: false
+    };
+  }
+
+  function aceUnsafeCatchUpMessage(candidate) {
+    const startWordCount = Math.max(0, Number(candidate?.startDocumentWordCount) || 0);
+    const endWordCount = Math.max(0, Number(candidate?.endDocumentWordCount) || 0);
+    if (startWordCount >= 100 && endWordCount === 0) {
+      return "That would set the manuscript to 0 words, so I stopped it. Enter the Google Docs word count shown in the lower-left corner.";
+    }
+
+    return "";
   }
 
   function aceSessionWordCount(session = aceActiveSession) {
@@ -955,7 +1560,12 @@
       return ` · (+${wordsAdded} words - ${wordsRemoved})`;
     }
 
-    return ` · ${aceFormatWords(aceSessionWordCount(session))}`;
+    const wordsAdded = Math.max(0, Number(session.wordsAdded) || 0);
+    const wordsRemoved = Math.max(0, Number(session.wordsRemoved) || 0);
+    const hasBreakdown = wordsRemoved > 0 || wordsAdded > aceSessionWordCount(session);
+    return hasBreakdown
+      ? ` · ${aceFormatWords(aceSessionWordCount(session))} (+${wordsAdded} words - ${wordsRemoved})`
+      : ` · ${aceFormatWords(aceSessionWordCount(session))}`;
   }
 
   function aceRenderActive() {
@@ -977,9 +1587,11 @@
     aceWidget.className = "ace-widget ace-widget--active";
     aceWidget.innerHTML = `
       ${aceCloseButtonHtml()}
-      <div class="ace-session-line">
+      ${acePanelHeaderHtml("Session", label)}
+      <div class="ace-session-metric">
         <span class="ace-session-type">${label}</span>
-        <span class="ace-time">${aceFormatTimer(aceElapsedMs())}</span>
+        <strong class="ace-time">${aceFormatTimer(aceElapsedMs())}</strong>
+        <small>Tracking from Google Docs</small>
       </div>
       <div class="ace-actions">
         <button class="ace-button ace-button--end" type="button" data-ace-action="end">End</button>
@@ -1015,6 +1627,7 @@
     aceWidget.className = "ace-widget ace-widget--completed";
     aceWidget.innerHTML = `
       ${aceCloseButtonHtml()}
+      ${acePanelHeaderHtml("Session saved", label)}
       <div class="ace-completed-copy">${label} session tracked: ${aceFormatCompletedMinutes(aceCompletedSession?.durationMinutes || 1)}${wordsCopy}</div>
       ${projectCopy}
       ${methodCopy}
@@ -1055,7 +1668,7 @@
     aceWidget.className = "ace-widget ace-widget--picker";
     aceWidget.innerHTML = `
       ${aceCloseButtonHtml()}
-      <div class="ace-prompt-copy">${copy}</div>
+      ${acePanelHeaderHtml(copy, "Projects")}
       <div class="ace-project-list">${rows}</div>
       <div class="ace-actions">
         <button class="ace-button" type="button" data-ace-action="open">Open app</button>
@@ -1103,7 +1716,7 @@
     aceWidget.innerHTML = `
       ${aceCloseButtonHtml()}
       <form class="ace-issue-form" data-ace-issue-form>
-        <div class="ace-prompt-copy">Add issue</div>
+        ${acePanelHeaderHtml("Add issue", "Edit dashboard")}
         ${statusCopy}
         <label class="ace-field">
           <span>Quick note</span>
@@ -1129,12 +1742,13 @@
           const snippet = aceNormalizeIssueNoteText(issue.snippet || issue.quoteLocator?.quote || "");
           return `
             <div class="ace-issue-row">
-              <div class="ace-issue-title">${aceEscapeHtml(issue.title || "Untitled issue")}</div>
-              <div class="ace-issue-meta">${aceEscapeHtml([issue.type, issue.priority, issue.sectionLabel].filter(Boolean).join(" | "))}</div>
-              ${snippet ? `<blockquote>${aceEscapeHtml(aceShortDiagnostic(snippet))}</blockquote>` : ""}
-              <div class="ace-actions">
-                <button class="ace-button" type="button" data-ace-action="find-quote" data-ace-issue-id="${aceEscapeHtml(issue.id)}" ${snippet ? "" : "disabled"}>Find quote</button>
-                <button class="ace-button" type="button" data-ace-action="copy-quote" data-ace-issue-id="${aceEscapeHtml(issue.id)}" ${snippet ? "" : "disabled"}>Copy quote</button>
+              <button class="ace-issue-summary" type="button" data-ace-action="show-issue-detail" data-ace-issue-id="${aceEscapeHtml(issue.id)}">
+                <span class="ace-issue-title">${aceEscapeHtml(issue.title || "Untitled issue")}</span>
+                <span class="ace-issue-meta">${aceEscapeHtml(aceIssueMetaLine(issue))}</span>
+                ${snippet ? `<blockquote>${aceEscapeHtml(aceShortDiagnostic(snippet))}</blockquote>` : ""}
+              </button>
+              <div class="ace-actions ace-issue-row-actions">
+                ${snippet ? `<button class="ace-button" type="button" data-ace-action="copy-quote" data-ace-issue-id="${aceEscapeHtml(issue.id)}">Copy quote</button>` : ""}
               </div>
             </div>
           `;
@@ -1147,16 +1761,90 @@
     aceWidget.className = "ace-widget ace-widget--issues";
     aceWidget.innerHTML = `
       ${aceCloseButtonHtml()}
-      <div class="ace-prompt-copy">Doc issues</div>
+      <div class="ace-issue-header">
+        ${acePanelHeaderHtml("Doc issues", "Edit dashboard")}
+        <button class="ace-link-button" type="button" data-ace-action="open-edit-dashboard">Open in app</button>
+      </div>
       ${messageCopy}
       <div class="ace-issue-list">${rows}</div>
-      <div class="ace-actions">
+      <div class="ace-actions ace-issue-footer-actions">
         <button class="ace-button ace-button--primary" type="button" data-ace-action="show-issue-form">Add issue</button>
-        <button class="ace-button" type="button" data-ace-action="open">Open app</button>
         <button class="ace-button" type="button" data-ace-action="cancel-issue">Done</button>
       </div>
     `;
     aceApplyWidgetPosition();
+  }
+
+  function aceRenderIssueDetail(issueId, message = "") {
+    const issue = aceFindIssueById(issueId);
+    if (!issue) {
+      aceRenderIssuesList("Issue not found.");
+      return;
+    }
+
+    const snippet = aceIssueQuote(issue);
+    const note = aceNormalizeIssueNoteText(issue.notes || issue.note || "");
+    const detailRows = aceIssueDetailRows(issue)
+      .map(function (row) {
+        return `
+          <div class="ace-detail-row">
+            <span>${aceEscapeHtml(row.label)}</span>
+            <strong>${aceEscapeHtml(row.value)}</strong>
+          </div>
+        `;
+      }).join("");
+    const messageCopy = message
+      ? `<div class="ace-sync-copy ace-sync-copy--pending">${aceEscapeHtml(message)}</div>`
+      : "";
+
+    aceWidget.className = "ace-widget ace-widget--issue-detail";
+    aceWidget.innerHTML = `
+      ${aceCloseButtonHtml()}
+      ${acePanelHeaderHtml("Issue details", "Edit dashboard")}
+      ${messageCopy}
+      <div class="ace-issue-detail">
+        <div class="ace-detail-heading">
+          <div class="ace-issue-title">${aceEscapeHtml(issue.title || "Untitled issue")}</div>
+          <div class="ace-issue-meta">${aceEscapeHtml(aceIssueMetaLine(issue))}</div>
+        </div>
+        ${detailRows ? `<div class="ace-detail-grid">${detailRows}</div>` : ""}
+        ${snippet ? `
+          <section class="ace-detail-section">
+            <div class="ace-detail-label">Quote</div>
+            <blockquote>${aceEscapeHtml(snippet)}</blockquote>
+            <div class="ace-actions">
+              <button class="ace-button" type="button" data-ace-action="copy-quote-detail" data-ace-issue-id="${aceEscapeHtml(issue.id)}">Copy quote</button>
+            </div>
+          </section>
+        ` : ""}
+        ${note ? `
+          <section class="ace-detail-section">
+            <div class="ace-detail-label">Note</div>
+            <p>${aceEscapeHtml(note)}</p>
+          </section>
+        ` : ""}
+      </div>
+      <div class="ace-actions ace-issue-footer-actions">
+        <button class="ace-button ace-button--primary" type="button" data-ace-action="back-to-issues">Back</button>
+        <button class="ace-button" type="button" data-ace-action="cancel-issue">Done</button>
+      </div>
+    `;
+    aceApplyWidgetPosition();
+  }
+
+  function aceIssueMetaLine(issue) {
+    return [issue.type, issue.priority, issue.sectionLabel].filter(Boolean).join(" | ");
+  }
+
+  function aceIssueDetailRows(issue) {
+    return [
+      { label: "Priority", value: issue.priority },
+      { label: "Status", value: issue.status },
+      { label: "Section", value: issue.sectionLabel },
+      { label: "Location", value: issue.textLocation }
+    ].filter(function (row) {
+      return aceNormalizeIssueNoteText(row.value);
+    });
   }
 
   function aceEscapeHtml(value) {
@@ -1174,7 +1862,19 @@
   }
 
   function aceCloseButtonHtml() {
-    return '<button class="ace-close-button" type="button" data-ace-action="close-popup" aria-label="Close Author Companion controls">&times;</button>';
+    return '<button class="ace-close-button" type="button" data-ace-action="close-popup" aria-label="Close Scriptor controls">&times;</button>';
+  }
+
+  function acePanelHeaderHtml(title, meta) {
+    return `
+      <div class="ace-panel-head">
+        <span class="ace-brand-mark" aria-hidden="true"></span>
+        <div>
+          <strong>${aceEscapeHtml(title)}</strong>
+          ${meta ? `<span>${aceEscapeHtml(meta)}</span>` : ""}
+        </div>
+      </div>
+    `;
   }
 
   function aceIsActiveSessionCurrent(extensionSessionId) {
@@ -1193,7 +1893,7 @@
 
   function aceRunAsync(promise, label) {
     Promise.resolve(promise).catch(function (error) {
-      console.warn(`Author Companion: ${label} failed.`, error);
+      console.warn(`Scriptor: ${label} failed.`, error);
     });
   }
 
@@ -1310,7 +2010,7 @@
     aceRememberIssueReturnState();
     aceClearTimer();
     aceState = "issues-loading";
-    aceRenderLoading("Loading issues...", "Checking Author Companion.");
+    aceRenderLoading("Loading issues...", "Checking Scriptor.");
     await aceNextFrame();
 
     try {
@@ -1489,165 +2189,106 @@
     return aceNormalizeIssueNoteText(issue?.snippet || issue?.quoteLocator?.quote || "");
   }
 
-  function aceQuoteSearchCandidates(quote) {
-    const normalizedQuote = aceNormalizeIssueNoteText(quote);
-    const candidates = [
-      normalizedQuote,
-      normalizedQuote.slice(0, 180),
-      normalizedQuote.slice(0, 120),
-      normalizedQuote.slice(0, 80)
-    ];
-    const sentence = normalizedQuote.match(/^.{24,}?[.!?](\s|$)/);
-    if (sentence?.[0]) {
-      candidates.push(sentence[0]);
-    }
-    const words = normalizedQuote.split(" ").filter(Boolean);
-    for (let index = 0; index < words.length; index += 6) {
-      candidates.push(words.slice(index, index + 12).join(" "));
-    }
-
-    return [...new Set(candidates.map(aceNormalizeIssueNoteText))]
-      .filter(function (candidate) {
-        return candidate.length >= 24;
-      });
-  }
-
-  function aceSelectionNode() {
-    const selection = window.getSelection ? window.getSelection() : null;
-    if (!selection?.rangeCount) {
-      return null;
-    }
-
-    const node = selection.getRangeAt(0).startContainer;
-    return node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
-  }
-
-  function aceSelectionIsInWidget() {
-    const node = aceSelectionNode();
-    return Boolean(node && aceWidget?.contains(node));
-  }
-
-  function aceScrollSelectionIntoView() {
-    const node = aceSelectionNode();
-    if (!node || aceSelectionIsInWidget()) {
-      return false;
-    }
-
-    const target = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
-    target?.scrollIntoView?.({ block: "center", inline: "nearest", behavior: "smooth" });
-    return true;
-  }
-
-  async function aceFindQuoteInCurrentFrame(quote) {
-    if (!window.find) {
-      return false;
-    }
-
-    document.activeElement?.blur?.();
-    for (const candidate of aceQuoteSearchCandidates(quote)) {
-      try {
-        window.getSelection?.().removeAllRanges?.();
-        const found = Boolean(window.find(candidate, false, false, true, false, false, false));
-        if (found && !aceSelectionIsInWidget()) {
-          await aceNextFrame();
-          aceScrollSelectionIntoView();
-          return true;
-        }
-      } catch (_error) {
-        // Try the next candidate.
-      }
-    }
-
-    return false;
-  }
-
-  function aceFindQuoteInChildFrames(quote) {
-    if (!ACE_IS_TOP_FRAME || !window.frames?.length) {
-      return Promise.resolve(false);
-    }
-
-    const token = `ace-find-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    return new Promise(function (resolve) {
-      let settled = false;
-      let pending = window.frames.length;
-
-      function finish(found) {
-        if (settled) {
-          return;
-        }
-
-        if (found || pending <= 0) {
-          settled = true;
-          window.removeEventListener("message", handleResult);
-          resolve(Boolean(found));
-        }
-      }
-
-      function handleResult(event) {
-        if (event.data?.aceType !== ACE_QUOTE_FIND_RESULT_MESSAGE || event.data.token !== token) {
-          return;
-        }
-
-        pending -= 1;
-        finish(Boolean(event.data.found));
-      }
-
-      window.addEventListener("message", handleResult);
-      for (let index = 0; index < window.frames.length; index += 1) {
-        try {
-          window.frames[index].postMessage({ aceType: ACE_QUOTE_FIND_MESSAGE, token, quote }, "*");
-        } catch (_error) {
-          pending -= 1;
-        }
-      }
-      window.setTimeout(function () {
-        pending = 0;
-        finish(false);
-      }, 1200);
-    });
-  }
-
-  async function aceFindQuoteInDocument(quote) {
-    const previousDisplay = aceWidget?.style.display || "";
-    const previousVisibility = aceWidget?.style.visibility || "";
-    if (aceWidget) {
-      aceWidget.style.display = "none";
-      aceWidget.style.visibility = "hidden";
-    }
-    await aceNextFrame();
-
-    const found = await aceFindQuoteInCurrentFrame(quote)
-      || await aceFindQuoteInChildFrames(quote);
-
-    if (aceWidget) {
-      aceWidget.style.display = previousDisplay;
-      aceWidget.style.visibility = previousVisibility;
-    }
-    return found;
-  }
-
-  async function aceCopyIssueQuote(issueId) {
+  async function aceCopyIssueQuote(issueId, returnToDetail = false) {
     const issue = aceFindIssueById(issueId);
     const quote = aceIssueQuote(issue);
     const copied = await aceCopyText(quote);
-    aceRenderIssuesList(copied ? "Quote copied." : "Could not copy the quote.");
+    const message = copied ? "Quote copied." : "Could not copy the quote.";
+    if (returnToDetail) {
+      aceRenderIssueDetail(issueId, message);
+      return;
+    }
+    aceRenderIssuesList(message);
   }
 
-  async function aceFindIssueQuote(issueId) {
-    const issue = aceFindIssueById(issueId);
-    const quote = aceIssueQuote(issue);
-    if (!quote) {
-      aceRenderIssuesList("No quote saved for that issue.");
-      return;
+  async function aceBuildCatchUpCandidate(documentId) {
+    const baseline = await aceGetDocumentBaseline(documentId);
+    if (!baseline || !Number.isFinite(Number(baseline.endDocumentWordCount))) {
+      return { candidate: null, error: "" };
     }
 
-    const found = await aceFindQuoteInDocument(quote);
-    if (found) {
-      aceMinimizeWidget();
-      return;
+    const baselineWordCount = Math.max(0, Number(baseline.endDocumentWordCount) || 0);
+    const boundProject = await aceGetServerDocumentBinding(documentId);
+    if (boundProject?.id) {
+      await aceSaveLocalDocumentBinding(documentId, boundProject);
+    }
+    const currentSnapshot = await aceGoogleDocWordCountAfterSettle(documentId, baseline);
+    if (!currentSnapshot.ok || !Number.isFinite(currentSnapshot.wordCount)) {
+      return {
+        candidate: null,
+        error: `Could not check for missed words. ${currentSnapshot.error || "You can still start a session."}`
+      };
     }
 
-    aceRenderIssuesList("Could not jump to that quote. Make sure the quote text is still in this Google Doc.");
+    const currentWordCount = Math.max(0, Number(currentSnapshot.wordCount) || 0);
+    const suspiciousZeroWordCount = baselineWordCount >= 100
+      && currentWordCount === 0
+      && !Number.isFinite(currentSnapshot.visibleWordCount);
+    const appWordCount = Number(boundProject?.currentWordCount);
+    const shouldUseAppWordCount = Number.isFinite(appWordCount) && Math.max(0, appWordCount) !== currentWordCount;
+    const catchUpStartWordCount = shouldUseAppWordCount ? Math.max(0, appWordCount) : baselineWordCount;
+    const catchUpBaseline = shouldUseAppWordCount
+      ? {
+          ...baseline,
+          projectId: boundProject.id,
+          project: boundProject,
+          endDocumentWordCount: catchUpStartWordCount,
+          endDocumentWordCounts: null
+        }
+      : baseline;
+
+    if (suspiciousZeroWordCount) {
+      return {
+        candidate: {
+          documentId,
+          documentUrl: aceDocumentUrl(),
+          baseline: catchUpBaseline,
+          currentSnapshot,
+          startDocumentWordCount: catchUpStartWordCount,
+          endDocumentWordCount: null,
+          endDocumentWordCounts: null,
+          wordsWritten: 0,
+          wordsAdded: 0,
+          wordsRemoved: 0,
+          wordsEdited: 0,
+          netWordsChanged: 0,
+          sessionType: "writing",
+          needsWordCountConfirmation: true
+        },
+        error: ""
+      };
+    }
+
+    const netWordsChanged = currentWordCount - catchUpStartWordCount;
+    const wordsAdded = shouldUseAppWordCount
+      ? Math.max(0, netWordsChanged)
+      : Math.max(0, Number(currentSnapshot.wordsAdded) || 0);
+    const wordsRemoved = shouldUseAppWordCount
+      ? Math.max(0, -netWordsChanged)
+      : Math.max(0, Number(currentSnapshot.wordsRemoved) || 0);
+    const wordsEdited = wordsAdded + wordsRemoved;
+    if (wordsEdited <= 0) {
+      return { candidate: null, error: "" };
+    }
+
+    return {
+      candidate: {
+        documentId,
+        documentUrl: aceDocumentUrl(),
+        baseline: catchUpBaseline,
+        currentSnapshot,
+        startDocumentWordCount: catchUpStartWordCount,
+        endDocumentWordCount: currentWordCount,
+        endDocumentWordCounts: currentSnapshot.wordCounts || null,
+        wordsWritten: wordsRemoved > 0 ? 0 : wordsAdded,
+        wordsAdded,
+        wordsRemoved,
+        wordsEdited,
+        netWordsChanged,
+        sessionType: wordsRemoved > 0 ? "editing" : "writing"
+      },
+      error: ""
+    };
   }
 
   async function aceCheckCatchUpBeforeStartPrompt() {
@@ -1656,40 +2297,21 @@
     aceRenderLoading("Checking progress...", "Looking for missed words.");
     await aceNextFrame();
 
-    const documentId = aceExtractDocumentId();
-    const baseline = await aceGetDocumentBaseline(documentId);
-    if (!baseline || !Number.isFinite(Number(baseline.endDocumentWordCount))) {
+    const catchUpResult = await aceBuildCatchUpCandidate(aceExtractDocumentId());
+    if (catchUpResult.error) {
+      acePromptError = catchUpResult.error;
       aceState = "idle";
       aceShowStartPrompt();
       return;
     }
 
-    const currentSnapshot = await aceGoogleDocWordCount(documentId, true);
-    if (!currentSnapshot.ok || !Number.isFinite(currentSnapshot.wordCount)) {
-      acePromptError = `Could not check for missed words. ${currentSnapshot.error || "You can still start a session."}`;
+    if (!catchUpResult.candidate) {
       aceState = "idle";
       aceShowStartPrompt();
       return;
     }
 
-    const baselineWordCount = Math.max(0, Number(baseline.endDocumentWordCount) || 0);
-    const currentWordCount = Math.max(0, Number(currentSnapshot.wordCount) || 0);
-    const wordsWritten = currentWordCount - baselineWordCount;
-    if (wordsWritten <= 0) {
-      aceState = "idle";
-      aceShowStartPrompt();
-      return;
-    }
-
-    aceCatchUpCandidate = {
-      documentId,
-      documentUrl: aceDocumentUrl(),
-      baseline,
-      currentSnapshot,
-      startDocumentWordCount: baselineWordCount,
-      endDocumentWordCount: currentWordCount,
-      wordsWritten
-    };
+    aceCatchUpCandidate = catchUpResult.candidate;
     aceSyncStatus = "";
     aceSyncMessage = "";
     aceState = "catch-up";
@@ -1729,6 +2351,46 @@
     aceRenderIdle();
   }
 
+  async function aceActivateSessionFromSnapshot({
+    documentId,
+    extensionSessionId,
+    sessionType,
+    startSnapshot,
+    projectId = "",
+    hadDocumentActivity = false
+  }) {
+    const now = new Date().toISOString();
+    acePromptError = "";
+    aceState = "active";
+    aceActiveSession = {
+      startedAt: now,
+      sessionType: aceNormalizeSessionType(sessionType),
+      documentId,
+      projectId: projectId || "",
+      documentUrl: aceDocumentUrl(),
+      extensionSessionId,
+      wordsWritten: 0,
+      wordsEdited: 0,
+      wordsAdded: 0,
+      wordsRemoved: 0,
+      netWordsChanged: 0,
+      hadDocumentActivity: Boolean(hadDocumentActivity),
+      startDocumentWordCount: Number.isFinite(startSnapshot.wordCount)
+        ? startSnapshot.wordCount
+        : null,
+      startDocumentRevisionId: startSnapshot.revisionId || "",
+      wordCountMethod: startSnapshot.method || "google-docs-api",
+      wordCountError: ""
+    };
+    aceClearActivityTimers();
+    await acePersistActiveSession();
+    await aceRememberLastSessionType(sessionType);
+    aceStartTimer();
+    if (!projectId) {
+      aceRunAsync(aceResolveBindingForActiveSession(), "resolve active session binding");
+    }
+  }
+
   async function aceStartSession() {
     if (aceState !== "prompt") {
       return;
@@ -1740,8 +2402,18 @@
     await aceNextFrame();
 
     const documentId = aceExtractDocumentId();
-    const now = new Date().toISOString();
+    const catchUpResult = await aceBuildCatchUpCandidate(documentId);
+    if (catchUpResult.candidate) {
+      aceCatchUpCandidate = catchUpResult.candidate;
+      aceSyncStatus = "";
+      aceSyncMessage = "";
+      aceState = "catch-up";
+      aceRenderCatchUpPrompt();
+      return;
+    }
+
     const extensionSessionId = aceCreateExtensionSessionId(documentId);
+    const sessionType = await aceLastSessionType();
     const startSnapshot = await aceGoogleDocStartSnapshot(documentId, extensionSessionId, true);
     if (!startSnapshot.ok || !Number.isFinite(startSnapshot.wordCount)) {
       aceState = "prompt";
@@ -1750,31 +2422,97 @@
       return;
     }
 
-    acePromptError = "";
-    aceState = "active";
-    aceActiveSession = {
-      startedAt: now,
-      sessionType: "writing",
+    await aceActivateSessionFromSnapshot({
       documentId,
-      documentUrl: aceDocumentUrl(),
       extensionSessionId,
-      wordsWritten: 0,
-      wordsEdited: 0,
-      wordsAdded: 0,
-      wordsRemoved: 0,
-      netWordsChanged: 0,
-      hadDocumentActivity: false,
-      startDocumentWordCount: Number.isFinite(startSnapshot.wordCount)
-        ? startSnapshot.wordCount
-        : null,
-      startDocumentRevisionId: startSnapshot.revisionId || "",
-      wordCountMethod: "google-docs-api",
-      wordCountError: ""
-    };
-    aceClearActivityTimers();
-    await acePersistActiveSession();
-    aceStartTimer();
-    aceRunAsync(aceResolveBindingForActiveSession(), "resolve active session binding");
+      sessionType,
+      startSnapshot
+    });
+  }
+
+  function aceCanAutoStartBoundSession() {
+    return ACE_IS_TOP_FRAME
+      && aceState === "idle"
+      && !aceActiveSession
+      && !aceCompletedSession
+      && !aceCatchUpCandidate
+      && !aceAutoStartInFlight;
+  }
+
+  async function aceAutoStartBoundSessionFromActivity() {
+    if (!aceCanAutoStartBoundSession()) {
+      return;
+    }
+
+    const documentId = aceExtractDocumentId();
+    if (!documentId) {
+      return;
+    }
+
+    aceAutoStartInFlight = true;
+    try {
+      const binding = await aceGetBoundProjectForDocument(documentId);
+      if (
+        !binding?.projectId
+        || aceState !== "idle"
+        || aceActiveSession
+        || aceCompletedSession
+        || aceCatchUpCandidate
+      ) {
+        return;
+      }
+
+      aceState = "starting";
+      acePromptError = "";
+      aceRenderLoading("Starting session...", "Connected Scriptor project found.");
+      await aceNextFrame();
+
+      const extensionSessionId = aceCreateExtensionSessionId(documentId);
+      const sessionType = await aceLastSessionType();
+      const baseline = await aceGetDocumentBaseline(documentId);
+      let startSnapshot = await aceSeedGoogleDocStartSnapshotFromBaseline(
+        documentId,
+        extensionSessionId,
+        baseline
+      );
+      if (!startSnapshot) {
+        startSnapshot = await aceGoogleDocStartSnapshot(documentId, extensionSessionId, false);
+      }
+
+      if (!startSnapshot.ok || !Number.isFinite(startSnapshot.wordCount)) {
+        aceState = "prompt";
+        acePromptError = `Could not auto-start session. ${startSnapshot.error || "Check Google OAuth and try again."}`;
+        aceRenderPrompt();
+        return;
+      }
+
+      const suspiciousZeroWordCount = Number(baseline?.endDocumentWordCount) >= 100
+        && Number(startSnapshot.apiWordCount ?? startSnapshot.wordCount) === 0
+        && !Number.isFinite(startSnapshot.visibleWordCount);
+      if (suspiciousZeroWordCount) {
+        aceState = "prompt";
+        acePromptError = "Could not auto-start session because Google Docs returned 0 words.";
+        aceRenderPrompt();
+        return;
+      }
+
+      await aceActivateSessionFromSnapshot({
+        documentId,
+        extensionSessionId,
+        sessionType,
+        startSnapshot,
+        projectId: binding.projectId,
+        hadDocumentActivity: true
+      });
+    } catch (error) {
+      if (aceState === "starting") {
+        aceState = "prompt";
+        acePromptError = `Could not auto-start session. ${error.message || "Try starting manually."}`;
+        aceRenderPrompt();
+      }
+    } finally {
+      aceAutoStartInFlight = false;
+    }
   }
 
   async function aceRestoreSession() {
@@ -1832,9 +2570,10 @@
       return;
     }
 
+    const sessionType = aceActiveSession.sessionType === "writing" ? "editing" : "writing";
     aceActiveSession = {
       ...aceActiveSession,
-      sessionType: aceActiveSession.sessionType === "writing" ? "editing" : "writing",
+      sessionType,
       wordsWritten: Math.max(0, Number(aceActiveSession.wordsWritten) || 0),
       wordsEdited: Math.max(0, Number(aceActiveSession.wordsEdited) || 0),
       wordsAdded: Math.max(0, Number(aceActiveSession.wordsAdded) || 0),
@@ -1842,6 +2581,7 @@
       netWordsChanged: Number(aceActiveSession.netWordsChanged) || 0
     };
     await acePersistActiveSession();
+    await aceRememberLastSessionType(sessionType);
     aceRenderActive();
   }
 
@@ -1924,6 +2664,8 @@
       endDocumentWordCount: Number.isFinite(endDocumentWordCount)
         ? endDocumentWordCount
         : null,
+      endDocumentWordCounts: wordDiff.endWordCounts || null,
+      endDocumentRevisionId: wordDiff.revisionId || "",
       wordCountMethod: "google-docs-api",
       wordCountError,
       hadDocumentActivity: Boolean(activeSession.hadDocumentActivity),
@@ -1935,6 +2677,7 @@
     aceSyncMessage = "Syncing...";
     aceSelectedProject = null;
     aceActiveSession = null;
+    await aceRememberLastSessionType(activeSession.sessionType);
     await acePersistActiveSession();
     aceRenderCompleted();
     if (measurementPending) {
@@ -1974,6 +2717,7 @@
 
     aceCompletedSession = session;
     aceActiveSession = null;
+    await aceRememberLastSessionType(activeSession.sessionType);
     await acePersistActiveSession();
     await aceStorePendingSession(session);
   }
@@ -2253,7 +2997,42 @@
   }
 
   async function aceSyncCatchUpSession(projectOverride) {
-    const catchUpCandidate = aceCatchUpCandidate;
+    const originalCatchUpCandidate = aceCatchUpCandidate;
+    const manualEndWordCount = aceReadCatchUpEndWordCount();
+    if (!originalCatchUpCandidate) {
+      return;
+    }
+
+    if (!Number.isFinite(manualEndWordCount)) {
+      aceSyncStatus = "pending";
+      aceSyncMessage = "Enter the current Google Docs word count before logging catch-up.";
+      aceState = "catch-up";
+      aceRenderCatchUpPrompt();
+      return;
+    }
+
+    const adjustedCatchUpCandidate = aceRecalculateCatchUpCandidate(originalCatchUpCandidate, manualEndWordCount);
+    const unsafeMessage = aceUnsafeCatchUpMessage(adjustedCatchUpCandidate);
+    if (unsafeMessage) {
+      aceCatchUpCandidate = adjustedCatchUpCandidate;
+      aceSyncStatus = "pending";
+      aceSyncMessage = unsafeMessage;
+      aceState = "catch-up";
+      aceRenderCatchUpPrompt();
+      return;
+    }
+
+    if (adjustedCatchUpCandidate.wordsEdited <= 0) {
+      aceCatchUpCandidate = null;
+      aceSyncStatus = "";
+      aceSyncMessage = "";
+      aceState = "idle";
+      aceShowStartPrompt();
+      return;
+    }
+
+    aceCatchUpCandidate = adjustedCatchUpCandidate;
+    const catchUpCandidate = adjustedCatchUpCandidate;
     if (!catchUpCandidate) {
       return;
     }
@@ -2303,26 +3082,36 @@
 
     const endedAt = new Date().toISOString();
     const startedAt = new Date(Date.now() - 60000).toISOString();
-    const wordsWritten = Math.max(0, Number(catchUpCandidate.wordsWritten) || 0);
+    const sessionType = catchUpCandidate.sessionType === "editing" ? "editing" : "writing";
+    const wordsAdded = Math.max(0, Number(catchUpCandidate.wordsAdded) || 0);
+    const wordsRemoved = Math.max(0, Number(catchUpCandidate.wordsRemoved) || 0);
+    const wordsWritten = sessionType === "writing"
+      ? Math.max(0, Number(catchUpCandidate.wordsWritten) || wordsAdded)
+      : 0;
+    const wordsEdited = sessionType === "editing" ? wordsAdded + wordsRemoved : 0;
     const catchUpSession = {
       documentId: catchUpCandidate.documentId,
       projectId,
-      sessionType: "writing",
+      sessionType,
       startedAt,
       endedAt,
       durationMinutes: 1,
       source: "chrome-extension",
       documentUrl: catchUpCandidate.documentUrl || aceDocumentUrl(),
-      notes: "Catch-up: words added outside a tracked session.",
+      notes: sessionType === "editing"
+        ? "Catch-up: words edited outside a tracked session."
+        : "Catch-up: words added outside a tracked session.",
       extensionSessionId: aceCreateExtensionSessionId(catchUpCandidate.documentId),
       wordsWritten,
-      wordsEdited: 0,
-      wordsAdded: 0,
-      wordsRemoved: 0,
-      netWordsChanged: wordsWritten,
+      wordsEdited,
+      wordsAdded,
+      wordsRemoved,
+      netWordsChanged: catchUpCandidate.netWordsChanged,
       startDocumentWordCount: catchUpCandidate.startDocumentWordCount,
       startDocumentRevisionId: catchUpCandidate.baseline?.revisionId || "",
       endDocumentWordCount: catchUpCandidate.endDocumentWordCount,
+      endDocumentWordCounts: catchUpCandidate.endDocumentWordCounts || null,
+      endDocumentRevisionId: catchUpCandidate.currentSnapshot?.revisionId || "",
       wordCountMethod: "google-docs-api",
       wordCountError: "",
       hadDocumentActivity: true,
@@ -2490,6 +3279,8 @@
       wordsRemoved,
       netWordsChanged,
       endDocumentWordCount: wordDiff.wordCount,
+      endDocumentWordCounts: wordDiff.endWordCounts || null,
+      endDocumentRevisionId: wordDiff.revisionId || "",
       wordCountMethod: "google-docs-api",
       wordCountError: "",
       measurementPending: false
@@ -2531,7 +3322,7 @@
     aceNoteActiveDocumentActivity();
 
     if (ACE_IS_TOP_FRAME) {
-      aceSchedulePrompt();
+      aceRunAsync(aceAutoStartBoundSessionFromActivity(), "auto-start bound document session");
       return;
     }
 
@@ -2585,19 +3376,6 @@
     }
 
     aceRegisterWritingActivity();
-  }
-
-  async function aceHandleQuoteFindMessage(message) {
-    if (ACE_IS_TOP_FRAME || !message?.token) {
-      return;
-    }
-
-    const found = await aceFindQuoteInCurrentFrame(message.quote || "");
-    window.top.postMessage({
-      aceType: ACE_QUOTE_FIND_RESULT_MESSAGE,
-      token: message.token,
-      found
-    }, "*");
   }
 
   function aceGetAnchorPoint(position) {
@@ -2765,10 +3543,14 @@
       aceReturnFromIssue();
     } else if (action === "show-issues") {
       aceRunAsync(aceShowIssuesList(), "show issues");
+    } else if (action === "show-issue-detail") {
+      aceRenderIssueDetail(button.getAttribute("data-ace-issue-id"));
+    } else if (action === "back-to-issues") {
+      aceRenderIssuesList();
     } else if (action === "copy-quote") {
       aceRunAsync(aceCopyIssueQuote(button.getAttribute("data-ace-issue-id")), "copy quote");
-    } else if (action === "find-quote") {
-      aceRunAsync(aceFindIssueQuote(button.getAttribute("data-ace-issue-id")), "find quote");
+    } else if (action === "copy-quote-detail") {
+      aceRunAsync(aceCopyIssueQuote(button.getAttribute("data-ace-issue-id"), true), "copy quote");
     } else if (action === "close-popup") {
       aceMinimizeWidget();
     } else if (action === "add-catch-up") {
@@ -2783,6 +3565,8 @@
       aceRunAsync(aceSwitchSessionType(), "switch session type");
     } else if (action === "open") {
       aceOpenApp();
+    } else if (action === "open-edit-dashboard") {
+      aceOpenEditDashboard();
     } else if (action === "refresh-page") {
       window.location.reload();
     } else if (action === "retry-sync") {
@@ -2817,6 +3601,32 @@
   }
 
   function aceHandleWidgetInput(event) {
+    const catchUpInput = aceClosest(event.target, "[data-ace-catch-up-word-count]");
+    if (catchUpInput && aceWidget.contains(catchUpInput) && aceCatchUpCandidate) {
+      const wordCount = aceParseWordCountInput(catchUpInput.value);
+      const currentWordCountPreview = aceWidget.querySelector("[data-ace-current-word-count-preview]");
+      if (currentWordCountPreview) {
+        currentWordCountPreview.textContent = Number.isFinite(wordCount)
+          ? aceFormatNumber(wordCount)
+          : "an unknown number of";
+      }
+
+      const preview = aceWidget.querySelector("[data-ace-catch-up-preview]");
+      if (preview) {
+        preview.textContent = Number.isFinite(wordCount)
+          ? aceCatchUpActivity(aceRecalculateCatchUpCandidate(aceCatchUpCandidate, wordCount)).activityCopy
+          : "an unknown number of words";
+      }
+
+      aceSyncStatus = "";
+      aceSyncMessage = "";
+      const status = aceWidget.querySelector(".ace-sync-copy--pending");
+      if (status) {
+        status.remove();
+      }
+      return;
+    }
+
     const form = aceClosest(event.target, "[data-ace-issue-form]");
     if (!form || !aceWidget.contains(form)) {
       return;
@@ -2841,11 +3651,11 @@
   document.addEventListener("cut", aceHandleClipboardActivity, true);
 
   window.addEventListener("message", function (event) {
-    if (event.data?.aceType !== ACE_QUOTE_FIND_MESSAGE) {
+    if (event.data?.aceType !== ACE_VISIBLE_WORD_COUNT_MESSAGE) {
       return;
     }
 
-    aceRunAsync(aceHandleQuoteFindMessage(event.data), "find quote in document frame");
+    aceHandleVisibleWordCountMessage(event.data, event.source);
   });
 
   if (ACE_IS_TOP_FRAME) {
@@ -2855,7 +3665,7 @@
       }
 
       aceNoteActiveDocumentActivity();
-      aceSchedulePrompt();
+      aceRunAsync(aceAutoStartBoundSessionFromActivity(), "auto-start bound document session");
     });
 
     window.addEventListener("resize", aceApplyWidgetPosition);

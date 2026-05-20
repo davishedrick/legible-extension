@@ -21,7 +21,7 @@
           sendResponse({
             ok: false,
             status: 0,
-            error: error.message || "Author Companion API request failed."
+            error: error.message || "Scriptor API request failed."
           });
         });
 
@@ -87,7 +87,7 @@
       return {
         ok: false,
         status: 400,
-        error: "Invalid Author Companion API path."
+        error: "Invalid Scriptor API path."
       };
     }
 
@@ -117,7 +117,7 @@
       ok: response.ok,
       status: response.status,
       payload,
-      error: payload.error || response.statusText || "Author Companion API request failed."
+      error: payload.error || response.statusText || "Scriptor API request failed."
     };
   }
 
@@ -153,7 +153,8 @@
       status: snapshot.status,
       method: "google-docs-api",
       revisionId: snapshot.revisionId || "",
-      wordCount: snapshot.wordCount
+      wordCount: snapshot.wordCount,
+      wordCounts: snapshot.wordCounts
     };
   }
 
@@ -267,6 +268,7 @@
       startRevisionId: startSnapshot.revisionId || "",
       wordCount: endSnapshot.wordCount,
       startWordCount: startSnapshot.wordCount,
+      endWordCounts: endSnapshot.wordCounts,
       wordsAdded: diff.wordsAdded,
       wordsRemoved: diff.wordsRemoved,
       netWordsChanged: endSnapshot.wordCount - startSnapshot.wordCount
@@ -396,9 +398,7 @@
         });
       }
 
-      if (element?.tableOfContents?.content) {
-        collectStructuralElements(element.tableOfContents.content);
-      }
+      // Google Docs' visible manuscript word count excludes generated table-of-contents text.
     }
 
     function collectStructuralElements(elements) {
@@ -411,15 +411,6 @@
       }
 
       collectStructuralElements(documentTab.body?.content || []);
-      Object.values(documentTab.headers || {}).forEach(function (header) {
-        collectStructuralElements(header.content || []);
-      });
-      Object.values(documentTab.footers || {}).forEach(function (footer) {
-        collectStructuralElements(footer.content || []);
-      });
-      Object.values(documentTab.footnotes || {}).forEach(function (footnote) {
-        collectStructuralElements(footnote.content || []);
-      });
     }
 
     function collectTab(tab) {
@@ -442,10 +433,17 @@
 
   function aceWordCountsInText(text) {
     const counts = {};
-    const matches = String(text || "").match(/[\p{L}\p{N}]+(?:['’-][\p{L}\p{N}]+)*/gu) || [];
-    matches.forEach(function (word) {
-      const normalized = word.toLocaleLowerCase();
-      counts[normalized] = (counts[normalized] || 0) + 1;
+    const matches = String(text || "").replace(/\u00a0/g, " ").match(/[^\s]+/gu) || [];
+    matches.forEach(function (token) {
+      token.split(/[\\/]+/u).forEach(function (part) {
+        const normalized = part
+          .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")
+          .toLocaleLowerCase();
+        if (!normalized || !/[\p{L}\p{N}]/u.test(normalized)) {
+          return;
+        }
+        counts[normalized] = (counts[normalized] || 0) + 1;
+      });
     });
     return counts;
   }

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Author Companion",
+  "name": "Scriptor",
   "version": "0.1.3",
-  "description": "A lightweight Google Docs companion that starts Author Companion sessions when writing begins.",
+  "description": "A lightweight Google Docs companion that starts Scriptor sessions when writing begins.",
   "permissions": ["storage", "identity"],
   "host_permissions": [
     "https://davishedrick.pythonanywhere.com/*",
