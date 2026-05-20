@@ -16,6 +16,7 @@
   const ACE_GOOGLE_DOC_DIFF_MESSAGE = "ace-google-doc-diff";
   const ACE_WORD_SNAPSHOT_STORAGE_PREFIX = "aceWordSnapshot:";
   const ACE_AUTO_START_UNBOUND_RECHECK_MS = 30000;
+  const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v2";
   const ACE_IS_TOP_FRAME = window.top === window;
   const ACE_ISSUE_TITLE_WORD_LIMIT = 8;
 
@@ -582,6 +583,7 @@
           project: project || null,
           endDocumentWordCount: Math.max(0, endWordCount),
           endDocumentWordCounts: session?.endDocumentWordCounts || session?.endWordCounts || null,
+          endDocumentWordCountTokenizerVersion: session?.wordCountTokenizerVersion || session?.endDocumentWordCountTokenizerVersion || "",
           revisionId: session?.endDocumentRevisionId || session?.revisionId || "",
           syncedAt: new Date().toISOString(),
           sessionId: session.extensionSessionId || ""
@@ -612,6 +614,7 @@
           project,
           endDocumentWordCount: Math.max(0, wordCount),
           endDocumentWordCounts: snapshot.wordCounts || null,
+          endDocumentWordCountTokenizerVersion: snapshot.wordCountTokenizerVersion || "",
           revisionId: snapshot.revisionId || "",
           syncedAt: new Date().toISOString(),
           sessionId: ""
@@ -640,7 +643,11 @@
     }
 
     const existingBaseline = await aceGetDocumentBaseline(documentId);
-    if (existingBaseline?.endDocumentWordCounts && Number.isFinite(Number(existingBaseline.endDocumentWordCount))) {
+    if (
+      existingBaseline?.endDocumentWordCounts
+      && existingBaseline.endDocumentWordCountTokenizerVersion === ACE_WORD_TOKENIZER_VERSION
+      && Number.isFinite(Number(existingBaseline.endDocumentWordCount))
+    ) {
       return;
     }
 
@@ -814,6 +821,7 @@
       visibleWordCount: Number.isFinite(visibleWordCount) ? Math.max(0, visibleWordCount) : null,
       wordCounts: response.wordCounts || null,
       endWordCounts: response.endWordCounts || null,
+      wordCountTokenizerVersion: response.wordCountTokenizerVersion || "",
       wordsAdded: Number.isFinite(wordsAdded) ? Math.max(0, wordsAdded) : 0,
       wordsRemoved: Number.isFinite(wordsRemoved) ? Math.max(0, wordsRemoved) : 0,
       netWordsChanged: Number.isFinite(netWordsChanged) ? netWordsChanged : 0
@@ -1155,14 +1163,16 @@
     if (!documentId || !extensionSessionId || !Number.isFinite(wordCount)) {
       return null;
     }
-    const hasWordMap = Boolean(wordCounts);
+    const baselineTokenizerVersion = baseline?.endDocumentWordCountTokenizerVersion || baseline?.wordCountTokenizerVersion || "";
+    const hasWordMap = Boolean(wordCounts && baselineTokenizerVersion === ACE_WORD_TOKENIZER_VERSION);
 
     await aceStorageSet({
       [aceSnapshotStorageKey(extensionSessionId)]: {
         documentId,
         revisionId: baseline.revisionId || "",
         wordCount,
-        wordCounts: wordCounts || null,
+        wordCounts: hasWordMap ? wordCounts : null,
+        wordCountTokenizerVersion: hasWordMap ? ACE_WORD_TOKENIZER_VERSION : "",
         createdAt: new Date().toISOString(),
         source: hasWordMap ? "local-baseline" : "visible-total-baseline"
       }
@@ -1174,10 +1184,11 @@
       method: hasWordMap ? "local-baseline" : "visible-total-baseline",
       revisionId: baseline.revisionId || "",
       wordCount,
-      wordCounts: wordCounts || null,
+      wordCounts: hasWordMap ? wordCounts : null,
+      wordCountTokenizerVersion: hasWordMap ? ACE_WORD_TOKENIZER_VERSION : "",
       wordCountDiagnostic: hasWordMap
         ? ""
-        : `W-START-SAVED-TOTAL-BASELINE: started from saved total ${wordCount}; exact added/removed split requires a current Google API word map.`
+        : `W-START-SAVED-TOTAL-BASELINE: started from saved total ${wordCount}; exact added/removed split requires a current ${ACE_WORD_TOKENIZER_VERSION} Google API word map.`
     };
   }
 
@@ -1596,7 +1607,10 @@
     await aceDelay(ACE_GOOGLE_DOC_SETTLE_DELAY_MS);
 
     const baselineWordCount = Math.max(0, Number(baseline?.endDocumentWordCount) || 0);
-    const baselineWordCounts = baseline?.endDocumentWordCounts || baseline?.wordCounts || null;
+    const baselineTokenizerVersion = baseline?.endDocumentWordCountTokenizerVersion || baseline?.wordCountTokenizerVersion || "";
+    const baselineWordCounts = baselineTokenizerVersion === ACE_WORD_TOKENIZER_VERSION
+      ? baseline?.endDocumentWordCounts || baseline?.wordCounts || null
+      : null;
     let bestResponse = {
       ok: false,
       wordCount: null,
@@ -3143,6 +3157,7 @@
         : null,
       endDocumentWordCounts: wordDiff.endWordCounts || null,
       endDocumentRevisionId: wordDiff.revisionId || "",
+      wordCountTokenizerVersion: wordDiff.wordCountTokenizerVersion || "",
       wordCountMethod: "google-docs-api",
       wordCountError,
       wordCountDiagnostic,
@@ -3611,6 +3626,7 @@
       endDocumentWordCount: catchUpCandidate.endDocumentWordCount,
       endDocumentWordCounts: catchUpCandidate.endDocumentWordCounts || null,
       endDocumentRevisionId: catchUpCandidate.currentSnapshot?.revisionId || "",
+      wordCountTokenizerVersion: catchUpCandidate.currentSnapshot?.wordCountTokenizerVersion || "",
       wordCountMethod: "google-docs-api",
       wordCountError: "",
       hadDocumentActivity: true,
@@ -3778,6 +3794,7 @@
           endDocumentWordCount: visibleFallback.wordCount,
           endDocumentWordCounts: null,
           endDocumentRevisionId: "",
+          wordCountTokenizerVersion: "",
           wordCountMethod: "visible-total-fallback",
           wordCountError: "",
           wordCountDiagnostic: aceGoogleDocDiffDiagnostic({
@@ -3839,6 +3856,7 @@
       endDocumentWordCount: wordDiff.wordCount,
       endDocumentWordCounts: wordDiff.endWordCounts || null,
       endDocumentRevisionId: wordDiff.revisionId || "",
+      wordCountTokenizerVersion: wordDiff.wordCountTokenizerVersion || "",
       wordCountMethod: "google-docs-api",
       wordCountError: "",
       wordCountDiagnostic: wordDiff.wordCountDiagnostic || aceGoogleDocDiffDiagnostic({

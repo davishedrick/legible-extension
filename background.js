@@ -8,6 +8,7 @@
   const ACE_GOOGLE_DOC_DIFF_MESSAGE = "ace-google-doc-diff";
   const ACE_GOOGLE_DOCS_SCOPE = "https://www.googleapis.com/auth/documents.readonly";
   const ACE_WORD_SNAPSHOT_STORAGE_PREFIX = "aceWordSnapshot:";
+  const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v2";
 
   chrome.runtime.onMessage.addListener(function (message, _sender, sendResponse) {
     if (!message) {
@@ -154,6 +155,7 @@
       method: "google-docs-api",
       revisionId: snapshot.revisionId || "",
       wordCount: snapshot.wordCount,
+      wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion,
       wordCounts: snapshot.wordCounts
     };
   }
@@ -186,6 +188,7 @@
         revisionId: snapshot.revisionId,
         wordCount: snapshot.wordCount,
         wordCounts: snapshot.wordCounts,
+        wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion,
         createdAt: new Date().toISOString()
       }
     });
@@ -194,7 +197,8 @@
       documentId,
       extensionSessionId,
       revisionId: snapshot.revisionId || "",
-      wordCount: snapshot.wordCount
+      wordCount: snapshot.wordCount,
+      wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion
     });
 
     return {
@@ -202,7 +206,9 @@
       status: snapshot.status,
       method: "google-docs-api",
       revisionId: snapshot.revisionId || "",
-      wordCount: snapshot.wordCount
+      wordCount: snapshot.wordCount,
+      wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion,
+      wordCounts: snapshot.wordCounts
     };
   }
 
@@ -255,6 +261,17 @@
       };
     }
 
+    if (startSnapshot.wordCountTokenizerVersion !== ACE_WORD_TOKENIZER_VERSION) {
+      return {
+        ok: false,
+        status: 409,
+        wordCount: null,
+        wordsAdded: 0,
+        wordsRemoved: 0,
+        error: `E-TOKENIZER-VERSION: The before snapshot used ${startSnapshot.wordCountTokenizerVersion || "an old tokenizer"}, but this extension uses ${ACE_WORD_TOKENIZER_VERSION}. Start a new session so added/removed words can be compared accurately.`
+      };
+    }
+
     const endSnapshot = await aceFetchGoogleDocSnapshot(documentId, Boolean(message.interactive));
     const diff = aceCompareWordCounts(startSnapshot.wordCounts, endSnapshot.wordCounts);
 
@@ -280,6 +297,7 @@
       wordCount: endSnapshot.wordCount,
       startWordCount: startSnapshot.wordCount,
       endWordCounts: endSnapshot.wordCounts,
+      wordCountTokenizerVersion: endSnapshot.wordCountTokenizerVersion,
       wordsAdded: diff.wordsAdded,
       wordsRemoved: diff.wordsRemoved,
       netWordsChanged: endSnapshot.wordCount - startSnapshot.wordCount
@@ -320,6 +338,7 @@
     return {
       status: response.status,
       revisionId: documentPayload.revisionId || "",
+      wordCountTokenizerVersion: ACE_WORD_TOKENIZER_VERSION,
       wordCounts,
       wordCount: aceTotalWordCounts(wordCounts)
     };
@@ -444,17 +463,16 @@
 
   function aceWordCountsInText(text) {
     const counts = {};
-    const matches = String(text || "").replace(/\u00a0/g, " ").match(/[^\s]+/gu) || [];
+    const textForCounting = String(text || "")
+      .normalize("NFKC")
+      .replace(/\u00a0/g, " ");
+    const matches = textForCounting.match(/[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu) || [];
     matches.forEach(function (token) {
-      token.split(/[\\/]+/u).forEach(function (part) {
-        const normalized = part
-          .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")
-          .toLocaleLowerCase();
-        if (!normalized || !/[\p{L}\p{N}]/u.test(normalized)) {
-          return;
-        }
-        counts[normalized] = (counts[normalized] || 0) + 1;
-      });
+      const normalized = token.toLocaleLowerCase();
+      if (!normalized || !/[\p{L}\p{N}]/u.test(normalized)) {
+        return;
+      }
+      counts[normalized] = (counts[normalized] || 0) + 1;
     });
     return counts;
   }
