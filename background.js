@@ -128,7 +128,7 @@
         ok: false,
         status: 400,
         wordCount: null,
-        error: "Google Docs document ID is required."
+        error: "E-DOC-ID-MISSING: Google Docs document ID is required."
       };
     }
 
@@ -137,7 +137,7 @@
         ok: false,
         status: 400,
         wordCount: null,
-        error: "Google OAuth client ID is not configured."
+        error: "E-GOOGLE-OAUTH-CONFIG: Google OAuth client ID is not configured."
       };
     }
 
@@ -166,7 +166,7 @@
         ok: false,
         status: 400,
         wordCount: null,
-        error: "Google Docs document ID and session ID are required."
+        error: "E-SNAPSHOT-INPUT: Google Docs document ID and session ID are required."
       };
     }
 
@@ -175,7 +175,7 @@
         ok: false,
         status: 400,
         wordCount: null,
-        error: "Google OAuth client ID is not configured."
+        error: "E-GOOGLE-OAUTH-CONFIG: Google OAuth client ID is not configured."
       };
     }
 
@@ -216,7 +216,7 @@
         wordCount: null,
         wordsAdded: 0,
         wordsRemoved: 0,
-        error: "Google Docs document ID and session ID are required."
+        error: "E-DIFF-INPUT: Google Docs document ID and session ID are required."
       };
     }
 
@@ -227,7 +227,7 @@
         wordCount: null,
         wordsAdded: 0,
         wordsRemoved: 0,
-        error: "Google OAuth client ID is not configured."
+        error: "E-GOOGLE-OAUTH-CONFIG: Google OAuth client ID is not configured."
       };
     }
 
@@ -240,7 +240,7 @@
         wordCount: null,
         wordsAdded: 0,
         wordsRemoved: 0,
-        error: "The Google Docs start snapshot is missing. Start a new session."
+        error: "E-SNAPSHOT-MISSING: No Google API before snapshot exists for this session. Reload the Google Doc after choosing a project, wait two seconds, then start a new session."
       };
     }
 
@@ -299,7 +299,7 @@
         // Keep the HTTP status text when Google does not return JSON.
       }
 
-      const failure = new Error(error);
+      const failure = new Error(`E-GOOGLE-API-${response.status}: ${error}`);
       failure.status = response.status;
       throw failure;
     }
@@ -328,7 +328,7 @@
         },
         function (token) {
           if (chrome.runtime.lastError || !token) {
-            reject(new Error(chrome.runtime.lastError?.message || "Google sign-in was not completed."));
+            reject(new Error(`E-GOOGLE-OAUTH: ${chrome.runtime.lastError?.message || "Google sign-in was not completed."}`));
             return;
           }
 
