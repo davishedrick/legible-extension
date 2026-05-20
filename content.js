@@ -2515,6 +2515,22 @@
     }
   }
 
+  async function aceTrackOrPromptFromActivity() {
+    if (!aceCanAutoStartBoundSession()) {
+      return;
+    }
+
+    await aceAutoStartBoundSessionFromActivity();
+    if (
+      aceState === "idle"
+      && !aceActiveSession
+      && !aceCompletedSession
+      && !aceCatchUpCandidate
+    ) {
+      aceShowStartPrompt();
+    }
+  }
+
   async function aceRestoreSession() {
     const stored = await aceStorageGet(ACE_LOCAL_STORAGE.activeSession);
     const activeSession = stored[ACE_LOCAL_STORAGE.activeSession];
@@ -2746,7 +2762,17 @@
     }
 
     try {
-      const binding = await aceGetLocalDocumentBinding(documentId);
+      let binding = await aceGetLocalDocumentBinding(documentId);
+      if (!binding?.projectId) {
+        const serverProject = await aceGetServerDocumentBinding(documentId);
+        if (serverProject?.id) {
+          await aceSaveLocalDocumentBinding(documentId, serverProject);
+          binding = {
+            projectId: serverProject.id,
+            project: serverProject
+          };
+        }
+      }
       if (!aceIsActiveSessionCurrent(extensionSessionId)) {
         return;
       }
@@ -2790,7 +2816,17 @@
           return;
         }
 
-        const binding = await aceGetLocalDocumentBinding(documentId);
+        let binding = await aceGetLocalDocumentBinding(documentId);
+        if (!binding?.projectId) {
+          const serverProject = await aceGetServerDocumentBinding(documentId);
+          if (serverProject?.id) {
+            await aceSaveLocalDocumentBinding(documentId, serverProject);
+            binding = {
+              projectId: serverProject.id,
+              project: serverProject
+            };
+          }
+        }
         if (!aceIsCompletedSessionCurrent(completedSessionId)) {
           return;
         }
@@ -3322,7 +3358,7 @@
     aceNoteActiveDocumentActivity();
 
     if (ACE_IS_TOP_FRAME) {
-      aceRunAsync(aceAutoStartBoundSessionFromActivity(), "auto-start bound document session");
+      aceRunAsync(aceTrackOrPromptFromActivity(), "track or prompt from document activity");
       return;
     }
 
@@ -3665,7 +3701,7 @@
       }
 
       aceNoteActiveDocumentActivity();
-      aceRunAsync(aceAutoStartBoundSessionFromActivity(), "auto-start bound document session");
+      aceRunAsync(aceTrackOrPromptFromActivity(), "track or prompt from document activity");
     });
 
     window.addEventListener("resize", aceApplyWidgetPosition);
