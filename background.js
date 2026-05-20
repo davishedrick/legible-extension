@@ -233,6 +233,17 @@
 
     const stored = await aceStorageGet(aceSnapshotStorageKey(extensionSessionId));
     const startSnapshot = stored[aceSnapshotStorageKey(extensionSessionId)];
+    if (startSnapshot?.source === "visible-total-baseline") {
+      return {
+        ok: false,
+        status: 409,
+        wordCount: null,
+        wordsAdded: 0,
+        wordsRemoved: 0,
+        error: "E-VISIBLE-BASELINE: Session started from the visible Google Docs count because the extension context/API was unavailable. End measurement will use the visible count fallback if the API diff is unavailable."
+      };
+    }
+
     if (!startSnapshot?.wordCounts || startSnapshot.documentId !== documentId) {
       return {
         ok: false,

@@ -1080,6 +1080,56 @@
     });
   }
 
+  async function aceVisibleStartSnapshot(documentId, reason = "visible-start-fallback") {
+    const visibleWordCount = await aceVisibleGoogleDocWordCount();
+    if (!Number.isFinite(visibleWordCount)) {
+      return null;
+    }
+
+    return {
+      ok: true,
+      status: 200,
+      method: "visible-total-baseline",
+      revisionId: "",
+      wordCount: Math.max(0, visibleWordCount),
+      visibleWordCount: Math.max(0, visibleWordCount),
+      wordCounts: null,
+      wordCountDiagnostic: `W-START-VISIBLE-FALLBACK: started from visible Google Docs count ${Math.max(0, visibleWordCount)} because ${reason}.`
+    };
+  }
+
+  async function aceStartSnapshotWithVisibleFallback(documentId, extensionSessionId, interactive, context) {
+    const startSnapshot = await aceGoogleDocStartSnapshot(documentId, extensionSessionId, interactive);
+    if (startSnapshot.ok && Number.isFinite(startSnapshot.wordCount)) {
+      return startSnapshot;
+    }
+
+    const visibleSnapshot = await aceVisibleStartSnapshot(
+      documentId,
+      startSnapshot.error || `${context} Google API start snapshot was unavailable`
+    );
+    if (visibleSnapshot) {
+      await aceStorageSet({
+        [aceSnapshotStorageKey(extensionSessionId)]: {
+          documentId,
+          revisionId: "",
+          wordCount: visibleSnapshot.wordCount,
+          wordCounts: null,
+          createdAt: new Date().toISOString(),
+          source: "visible-total-baseline"
+        }
+      });
+      return visibleSnapshot;
+    }
+
+    return {
+      ...startSnapshot,
+      error: aceIsExtensionContextError(startSnapshot.error)
+        ? `E-CONTEXT-INVALIDATED: ${startSnapshot.error} Reload this Google Doc after reloading the extension.`
+        : startSnapshot.error
+    };
+  }
+
   async function aceSeedGoogleDocStartSnapshotFromBaseline(documentId, extensionSessionId, baseline) {
     const wordCount = aceOptionalWordCount(baseline?.endDocumentWordCount);
     const wordCounts = baseline?.endDocumentWordCounts || baseline?.wordCounts || null;
@@ -2726,7 +2776,8 @@
         : null,
       startDocumentRevisionId: startSnapshot.revisionId || "",
       wordCountMethod: startSnapshot.method || "google-docs-api",
-      wordCountError: ""
+      wordCountError: "",
+      wordCountDiagnostic: startSnapshot.wordCountDiagnostic || ""
     };
     aceClearActivityTimers();
     await acePersistActiveSession();
@@ -2760,7 +2811,12 @@
 
     const extensionSessionId = aceCreateExtensionSessionId(documentId);
     const sessionType = await aceLastSessionType();
-    const startSnapshot = await aceGoogleDocStartSnapshot(documentId, extensionSessionId, true);
+    const startSnapshot = await aceStartSnapshotWithVisibleFallback(
+      documentId,
+      extensionSessionId,
+      true,
+      "manual start"
+    );
     if (!startSnapshot.ok || !Number.isFinite(startSnapshot.wordCount)) {
       aceState = "prompt";
       acePromptError = `Google Docs word count is required. ${startSnapshot.error || "Check Google OAuth and try again."}`;
@@ -2822,7 +2878,12 @@
         baseline
       );
       if (!startSnapshot) {
-        startSnapshot = await aceGoogleDocStartSnapshot(documentId, extensionSessionId, false);
+        startSnapshot = await aceStartSnapshotWithVisibleFallback(
+          documentId,
+          extensionSessionId,
+          false,
+          "auto-start"
+        );
       }
 
       if (!startSnapshot.ok || !Number.isFinite(startSnapshot.wordCount)) {
@@ -3003,7 +3064,7 @@
     const wordCountError = measurementPending
       ? wordDiff.error || "Google Docs word count unavailable."
       : "";
-    const wordCountDiagnostic = wordDiff.wordCountDiagnostic || aceGoogleDocDiffDiagnostic({
+    const wordCountDiagnostic = wordDiff.wordCountDiagnostic || activeSession.wordCountDiagnostic || aceGoogleDocDiffDiagnostic({
       code: measurementPending ? "E-API-UNAVAILABLE" : "D-API-DIFF",
       startWordCount: activeSession.startDocumentWordCount,
       apiEndWordCount: endDocumentWordCount,
@@ -3091,7 +3152,7 @@
       endDocumentWordCount: null,
       wordCountMethod: "google-docs-api",
       wordCountError: "Document closed before Google Docs word count completed.",
-      wordCountDiagnostic: "E-DOC-CLOSED: The document closed before the extension could take the Google API after snapshot.",
+      wordCountDiagnostic: activeSession.wordCountDiagnostic || "E-DOC-CLOSED: The document closed before the extension could take the Google API after snapshot.",
       hadDocumentActivity: Boolean(activeSession.hadDocumentActivity),
       measurementPending: true
     };
@@ -3662,6 +3723,44 @@
     }
 
     if (!wordDiff.ok || !Number.isFinite(wordDiff.wordCount)) {
+      const visibleFallback = await aceVisibleStartSnapshot(
+        completedSession.documentId,
+        wordDiff.error || "retry Google API diff was unavailable"
+      );
+      if (visibleFallback && Number.isFinite(completedSession.startDocumentWordCount)) {
+        const netWordsChanged = visibleFallback.wordCount - completedSession.startDocumentWordCount;
+        const wordsAdded = Math.max(0, netWordsChanged);
+        const wordsRemoved = Math.max(0, -netWordsChanged);
+        aceCompletedSession = {
+          ...aceCompletedSession,
+          wordsWritten: completedSession.sessionType === "writing" ? Math.max(0, netWordsChanged) : 0,
+          wordsEdited: completedSession.sessionType === "editing" ? wordsAdded + wordsRemoved : 0,
+          wordsAdded,
+          wordsRemoved,
+          netWordsChanged,
+          endDocumentWordCount: visibleFallback.wordCount,
+          endDocumentWordCounts: null,
+          endDocumentRevisionId: "",
+          wordCountMethod: "visible-total-fallback",
+          wordCountError: "",
+          wordCountDiagnostic: aceGoogleDocDiffDiagnostic({
+            code: "W-END-VISIBLE-FALLBACK",
+            startWordCount: completedSession.startDocumentWordCount,
+            apiEndWordCount: wordDiff.wordCount,
+            visibleEndWordCount: visibleFallback.wordCount,
+            wordsAdded,
+            wordsRemoved,
+            netWordsChanged,
+            revisionChanged: false,
+            startRevisionId: completedSession.startDocumentRevisionId || "",
+            endRevisionId: "",
+            source: "visible-total-fallback"
+          }),
+          measurementPending: false
+        };
+        return true;
+      }
+
       aceCompletedSession = {
         ...aceCompletedSession,
         wordCountError: wordDiff.error || "Try again shortly.",
