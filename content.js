@@ -821,14 +821,12 @@
   }
 
   async function aceVisibleGoogleDocWordCount() {
-    const localCount = aceVisibleGoogleDocWordCountLocal();
-    const frameCount = ACE_IS_TOP_FRAME
-      ? await aceVisibleGoogleDocWordCountFromFrames()
+    const localCandidate = aceVisibleGoogleDocWordCountCandidateLocal();
+    const frameCandidate = ACE_IS_TOP_FRAME
+      ? await aceVisibleGoogleDocWordCountCandidateFromFrames()
       : null;
-    if (Number.isFinite(frameCount)) {
-      return frameCount;
-    }
-    return Number.isFinite(localCount) ? localCount : null;
+    const best = aceBestVisibleWordCountCandidate([localCandidate, frameCandidate]);
+    return Number.isFinite(best?.count) ? best.count : null;
   }
 
   function aceVisibleGoogleDocWordCountLocal() {
@@ -860,7 +858,7 @@
     return aceBestVisibleWordCountCandidate(candidates)?.count ?? null;
   }
 
-  function aceVisibleGoogleDocWordCountFromFrames() {
+  function aceVisibleGoogleDocWordCountCandidateFromFrames() {
     if (!ACE_IS_TOP_FRAME || !window.frames?.length) {
       return Promise.resolve(null);
     }
@@ -878,7 +876,7 @@
         settled = true;
         window.removeEventListener("message", handleResult);
         const best = aceBestVisibleWordCountCandidate(results);
-        resolve(Number.isFinite(best?.count) ? best.count : null);
+        resolve(best || null);
       }
 
       function handleResult(event) {
@@ -964,10 +962,25 @@
   }
 
   function aceBestVisibleWordCountCandidate(candidates) {
-    return (candidates || [])
+    const validCandidates = (candidates || [])
       .filter(function (candidate) {
         return candidate && Number.isFinite(candidate.count);
       })
+      .map(function (candidate) {
+        return {
+          ...candidate,
+          count: Math.max(0, Number(candidate.count) || 0)
+        };
+      });
+    const candidatesToRank = validCandidates.some(function (candidate) {
+      return candidate.count > 0;
+    })
+      ? validCandidates.filter(function (candidate) {
+        return candidate.count > 0;
+      })
+      : validCandidates;
+
+    return candidatesToRank
       .sort(function (a, b) {
         return (Number(b.score) || 0) - (Number(a.score) || 0)
           || (Number(b.bottom) || 0) - (Number(a.bottom) || 0)
@@ -1213,6 +1226,7 @@
     let bestActivity = Number.NEGATIVE_INFINITY;
     let bestNetMagnitude = Number.NEGATIVE_INFINITY;
     let bestAttempt = 0;
+    let bestVisibleFallbackResponse = null;
 
     for (let attempt = 0; attempt < ACE_GOOGLE_DOC_POLL_ATTEMPTS; attempt += 1) {
       const response = await aceGoogleDocMessage(ACE_GOOGLE_DOC_DIFF_MESSAGE, {
@@ -1321,6 +1335,19 @@
           });
           return measuredResponse;
         }
+
+        if (
+          !apiMatchesVisible
+          && Number.isFinite(visibleWordCount)
+          && visibleWordCount > 0
+        ) {
+          bestVisibleFallbackResponse = aceVisibleWordCountFallbackResponse(response, {
+            attempt: attempt + 1,
+            startWordCount,
+            startRevisionId,
+            revisionChanged
+          });
+        }
       }
 
       if (attempt < ACE_GOOGLE_DOC_POLL_ATTEMPTS - 1) {
@@ -1328,37 +1355,40 @@
       }
     }
 
-    const fallbackVisibleWordCount = Number(bestResponse.visibleWordCount);
-    const fallbackApiWordCount = Number(bestResponse.apiWordCount ?? bestResponse.wordCount);
-    if (
-      bestResponse.ok
-      && Number.isFinite(fallbackVisibleWordCount)
-      && Math.max(0, fallbackVisibleWordCount) !== Math.max(0, fallbackApiWordCount)
-    ) {
-      const fallbackResponse = aceVisibleWordCountFallbackResponse(bestResponse, {
-        attempt: bestAttempt,
-        startWordCount,
-        startRevisionId,
-        revisionChanged: Boolean(
-          startRevisionId
-          && bestResponse.revisionId
-          && bestResponse.revisionId !== startRevisionId
-        )
-      });
+    if (bestVisibleFallbackResponse) {
       console.info("[ACE] Selected visible word count fallback", {
-        attempt: bestAttempt,
+        attempt: bestVisibleFallbackResponse.wordCountDiagnostic || "",
         startWordCount,
-        apiEndWordCount: fallbackApiWordCount,
-        visibleEndWordCount: fallbackVisibleWordCount,
-        wordsAdded: fallbackResponse.wordsAdded,
-        wordsRemoved: fallbackResponse.wordsRemoved,
-        netWordsChanged: fallbackResponse.netWordsChanged,
-        wordCountDiagnostic: fallbackResponse.wordCountDiagnostic
+        apiEndWordCount: bestVisibleFallbackResponse.apiWordCount,
+        visibleEndWordCount: bestVisibleFallbackResponse.visibleWordCount,
+        wordsAdded: bestVisibleFallbackResponse.wordsAdded,
+        wordsRemoved: bestVisibleFallbackResponse.wordsRemoved,
+        netWordsChanged: bestVisibleFallbackResponse.netWordsChanged,
+        wordCountDiagnostic: bestVisibleFallbackResponse.wordCountDiagnostic
       });
-      return fallbackResponse;
+      return bestVisibleFallbackResponse;
     }
 
-    if (expectedRevisionChange && bestResponse.ok) {
+    const bestRevisionChanged = Boolean(
+      startRevisionId
+      && bestResponse.revisionId
+      && bestResponse.revisionId !== startRevisionId
+    );
+    const bestNetWordsChanged = Number.isFinite(bestResponse.netWordsChanged)
+      ? bestResponse.netWordsChanged
+      : Number.isFinite(startWordCount) && Number.isFinite(bestResponse.wordCount)
+        ? bestResponse.wordCount - startWordCount
+        : 0;
+    const bestTotalActivity = Math.max(0, Number(bestResponse.wordsAdded) || 0)
+      + Math.max(0, Number(bestResponse.wordsRemoved) || 0);
+
+    if (
+      expectedRevisionChange
+      && bestResponse.ok
+      && bestTotalActivity === 0
+      && bestNetWordsChanged === 0
+      && !bestRevisionChanged
+    ) {
       const fallbackNetWordsChanged = Number.isFinite(bestResponse.netWordsChanged)
         ? bestResponse.netWordsChanged
         : Number.isFinite(startWordCount) && Number.isFinite(bestResponse.wordCount)
