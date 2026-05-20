@@ -156,7 +156,8 @@
       revisionId: snapshot.revisionId || "",
       wordCount: snapshot.wordCount,
       wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion,
-      wordCounts: snapshot.wordCounts
+      wordCounts: snapshot.wordCounts,
+      wordTokens: snapshot.wordTokens
     };
   }
 
@@ -188,6 +189,7 @@
         revisionId: snapshot.revisionId,
         wordCount: snapshot.wordCount,
         wordCounts: snapshot.wordCounts,
+        wordTokens: snapshot.wordTokens,
         wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion,
         createdAt: new Date().toISOString()
       }
@@ -208,7 +210,8 @@
       revisionId: snapshot.revisionId || "",
       wordCount: snapshot.wordCount,
       wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion,
-      wordCounts: snapshot.wordCounts
+      wordCounts: snapshot.wordCounts,
+      wordTokens: snapshot.wordTokens
     };
   }
 
@@ -250,14 +253,14 @@
       };
     }
 
-    if (!startSnapshot?.wordCounts || startSnapshot.documentId !== documentId) {
+    if (!startSnapshot?.wordTokens || startSnapshot.documentId !== documentId) {
       return {
         ok: false,
         status: 404,
         wordCount: null,
         wordsAdded: 0,
         wordsRemoved: 0,
-        error: "E-SNAPSHOT-MISSING: No Google API before snapshot exists for this session. Reload the Google Doc after choosing a project, wait two seconds, then start a new session."
+        error: "E-SNAPSHOT-MISSING: No Google API before token snapshot exists for this session. Reload the Google Doc after choosing a project, wait two seconds, then start a new session."
       };
     }
 
@@ -273,7 +276,7 @@
     }
 
     const endSnapshot = await aceFetchGoogleDocSnapshot(documentId, Boolean(message.interactive));
-    const diff = aceCompareWordCounts(startSnapshot.wordCounts, endSnapshot.wordCounts);
+    const diff = aceCompareWordTokens(startSnapshot.wordTokens, endSnapshot.wordTokens);
 
     if (message.clearSnapshot) {
       await aceStorageRemove(aceSnapshotStorageKey(extensionSessionId));
@@ -297,10 +300,12 @@
       wordCount: endSnapshot.wordCount,
       startWordCount: startSnapshot.wordCount,
       endWordCounts: endSnapshot.wordCounts,
+      endWordTokens: endSnapshot.wordTokens,
       wordCountTokenizerVersion: endSnapshot.wordCountTokenizerVersion,
       wordsAdded: diff.wordsAdded,
       wordsRemoved: diff.wordsRemoved,
-      netWordsChanged: endSnapshot.wordCount - startSnapshot.wordCount
+      netWordsChanged: endSnapshot.wordCount - startSnapshot.wordCount,
+      wordDiffMethod: diff.method
     };
   }
 
@@ -334,13 +339,15 @@
     }
 
     const documentPayload = await response.json();
-    const wordCounts = aceWordCountsInText(aceExtractGoogleDocText(documentPayload));
+    const wordTokens = aceWordTokensInText(aceExtractGoogleDocText(documentPayload));
+    const wordCounts = aceWordCountsFromTokens(wordTokens);
     return {
       status: response.status,
       revisionId: documentPayload.revisionId || "",
       wordCountTokenizerVersion: ACE_WORD_TOKENIZER_VERSION,
+      wordTokens,
       wordCounts,
-      wordCount: aceTotalWordCounts(wordCounts)
+      wordCount: wordTokens.length
     };
   }
 
@@ -458,21 +465,31 @@
   }
 
   function aceCountWordsInText(text) {
-    return aceTotalWordCounts(aceWordCountsInText(text));
+    return aceWordTokensInText(text).length;
   }
 
   function aceWordCountsInText(text) {
-    const counts = {};
+    return aceWordCountsFromTokens(aceWordTokensInText(text));
+  }
+
+  function aceWordTokensInText(text) {
     const textForCounting = String(text || "")
       .normalize("NFKC")
       .replace(/\u00a0/g, " ");
     const matches = textForCounting.match(/[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu) || [];
-    matches.forEach(function (token) {
-      const normalized = token.toLocaleLowerCase();
-      if (!normalized || !/[\p{L}\p{N}]/u.test(normalized)) {
-        return;
-      }
-      counts[normalized] = (counts[normalized] || 0) + 1;
+    return matches
+      .map(function (token) {
+        return token.toLocaleLowerCase();
+      })
+      .filter(function (token) {
+        return Boolean(token) && /[\p{L}\p{N}]/u.test(token);
+      });
+  }
+
+  function aceWordCountsFromTokens(tokens) {
+    const counts = {};
+    (tokens || []).forEach(function (token) {
+      counts[token] = (counts[token] || 0) + 1;
     });
     return counts;
   }
@@ -502,5 +519,71 @@
     });
 
     return { wordsAdded, wordsRemoved };
+  }
+
+  function aceCompareWordTokens(startTokens, endTokens) {
+    const before = Array.isArray(startTokens) ? startTokens : [];
+    const after = Array.isArray(endTokens) ? endTokens : [];
+    let prefixLength = 0;
+    while (
+      prefixLength < before.length
+      && prefixLength < after.length
+      && before[prefixLength] === after[prefixLength]
+    ) {
+      prefixLength += 1;
+    }
+
+    let beforeEnd = before.length;
+    let afterEnd = after.length;
+    while (
+      beforeEnd > prefixLength
+      && afterEnd > prefixLength
+      && before[beforeEnd - 1] === after[afterEnd - 1]
+    ) {
+      beforeEnd -= 1;
+      afterEnd -= 1;
+    }
+
+    const removedTokens = before.slice(prefixLength, beforeEnd);
+    const addedTokens = after.slice(prefixLength, afterEnd);
+    if (!removedTokens.length || !addedTokens.length) {
+      return {
+        wordsAdded: addedTokens.length,
+        wordsRemoved: removedTokens.length,
+        method: "google-api-token-sequence"
+      };
+    }
+
+    const cellCount = removedTokens.length * addedTokens.length;
+    if (cellCount > 2000000) {
+      return {
+        ...aceCompareWordCounts(
+          aceWordCountsFromTokens(removedTokens),
+          aceWordCountsFromTokens(addedTokens)
+        ),
+        method: "google-api-token-map-fallback"
+      };
+    }
+
+    const lcsLength = aceLongestCommonSubsequenceLength(removedTokens, addedTokens);
+    return {
+      wordsAdded: addedTokens.length - lcsLength,
+      wordsRemoved: removedTokens.length - lcsLength,
+      method: "google-api-token-sequence"
+    };
+  }
+
+  function aceLongestCommonSubsequenceLength(before, after) {
+    let previous = new Uint32Array(after.length + 1);
+    for (let beforeIndex = 0; beforeIndex < before.length; beforeIndex += 1) {
+      const current = new Uint32Array(after.length + 1);
+      for (let afterIndex = 0; afterIndex < after.length; afterIndex += 1) {
+        current[afterIndex + 1] = before[beforeIndex] === after[afterIndex]
+          ? previous[afterIndex] + 1
+          : Math.max(previous[afterIndex + 1], current[afterIndex]);
+      }
+      previous = current;
+    }
+    return previous[after.length];
   }
 })();

@@ -583,6 +583,7 @@
           project: project || null,
           endDocumentWordCount: Math.max(0, endWordCount),
           endDocumentWordCounts: session?.endDocumentWordCounts || session?.endWordCounts || null,
+          endDocumentWordTokens: session?.endDocumentWordTokens || session?.endWordTokens || null,
           endDocumentWordCountTokenizerVersion: session?.wordCountTokenizerVersion || session?.endDocumentWordCountTokenizerVersion || "",
           revisionId: session?.endDocumentRevisionId || session?.revisionId || "",
           syncedAt: new Date().toISOString(),
@@ -614,6 +615,7 @@
           project,
           endDocumentWordCount: Math.max(0, wordCount),
           endDocumentWordCounts: snapshot.wordCounts || null,
+          endDocumentWordTokens: snapshot.wordTokens || null,
           endDocumentWordCountTokenizerVersion: snapshot.wordCountTokenizerVersion || "",
           revisionId: snapshot.revisionId || "",
           syncedAt: new Date().toISOString(),
@@ -644,7 +646,7 @@
 
     const existingBaseline = await aceGetDocumentBaseline(documentId);
     if (
-      existingBaseline?.endDocumentWordCounts
+      existingBaseline?.endDocumentWordTokens
       && existingBaseline.endDocumentWordCountTokenizerVersion === ACE_WORD_TOKENIZER_VERSION
       && Number.isFinite(Number(existingBaseline.endDocumentWordCount))
     ) {
@@ -704,7 +706,7 @@
       : Number(session?.netWordsChanged) || 0;
     const wordChangeBreakdown = aceWordChangeBreakdownForSync(session, measuredNetWordsChanged);
 
-    return {
+    const payload = {
       ...session,
       sessionType,
       wordsWritten: sessionType === "writing"
@@ -719,6 +721,10 @@
       wordCountMethod: session?.wordCountMethod || "google-docs-api",
       measurementPending: Boolean(session?.measurementPending)
     };
+    delete payload.endDocumentWordTokens;
+    delete payload.endWordTokens;
+    delete payload.wordTokens;
+    return payload;
   }
 
   function aceWordChangeBreakdownForSync(session, netWordsChanged) {
@@ -820,8 +826,11 @@
       apiWordCount: Number.isFinite(responseWordCount) ? Math.max(0, responseWordCount) : null,
       visibleWordCount: Number.isFinite(visibleWordCount) ? Math.max(0, visibleWordCount) : null,
       wordCounts: response.wordCounts || null,
+      wordTokens: response.wordTokens || null,
       endWordCounts: response.endWordCounts || null,
+      endWordTokens: response.endWordTokens || null,
       wordCountTokenizerVersion: response.wordCountTokenizerVersion || "",
+      wordDiffMethod: response.wordDiffMethod || "",
       wordsAdded: Number.isFinite(wordsAdded) ? Math.max(0, wordsAdded) : 0,
       wordsRemoved: Number.isFinite(wordsRemoved) ? Math.max(0, wordsRemoved) : 0,
       netWordsChanged: Number.isFinite(netWordsChanged) ? netWordsChanged : 0
@@ -1102,6 +1111,8 @@
       wordCount: Math.max(0, visibleWordCount),
       visibleWordCount: Math.max(0, visibleWordCount),
       wordCounts: null,
+      wordTokens: null,
+      wordCountTokenizerVersion: "",
       wordCountDiagnostic: `W-START-VISIBLE-FALLBACK: started from visible Google Docs count ${Math.max(0, visibleWordCount)} because ${reason}.`
     };
   }
@@ -1113,13 +1124,32 @@
         revisionId: "",
         wordCount: visibleSnapshot.wordCount,
         wordCounts: null,
+        wordTokens: null,
+        wordCountTokenizerVersion: "",
         createdAt: new Date().toISOString(),
         source: "visible-total-baseline"
       }
     });
   }
 
-  async function aceStartSnapshotWithVisibleFallback(documentId, extensionSessionId, interactive, context) {
+  function aceSessionTypeRequiresExactWordDiff(sessionType) {
+    return sessionType === "editing";
+  }
+
+  function aceSnapshotHasExactWordTokens(snapshot) {
+    return Boolean(
+      Array.isArray(snapshot?.wordTokens)
+      && snapshot.wordCountTokenizerVersion === ACE_WORD_TOKENIZER_VERSION
+    );
+  }
+
+  function aceExactWordDiffStartError(startSnapshot) {
+    return startSnapshot?.error
+      || `E-EXACT-START-TOKENS-MISSING: Editing sessions need a current ${ACE_WORD_TOKENIZER_VERSION} Google Docs before snapshot. Reload the doc, wait for the visible word count to settle, then start again.`;
+  }
+
+  async function aceStartSnapshotWithVisibleFallback(documentId, extensionSessionId, interactive, context, options = {}) {
+    const allowVisibleFallback = options.allowVisibleFallback !== false;
     const startSnapshot = await aceGoogleDocStartSnapshot(documentId, extensionSessionId, interactive);
     if (startSnapshot.ok && Number.isFinite(startSnapshot.wordCount)) {
       const visibleWordCount = Number(startSnapshot.visibleWordCount);
@@ -1128,6 +1158,13 @@
         && visibleWordCount > 0
         && Math.max(0, visibleWordCount) !== Math.max(0, Number(startSnapshot.wordCount))
       ) {
+        if (!allowVisibleFallback) {
+          return {
+            ...startSnapshot,
+            ok: false,
+            error: `E-EXACT-START-MISMATCH: Google Docs API start count ${Math.max(0, Number(startSnapshot.wordCount) || 0)} does not match the visible count ${Math.max(0, visibleWordCount)}. Wait for Google Docs to finish saving, then start a new editing session.`
+          };
+        }
         const visibleSnapshot = await aceVisibleStartSnapshot(
           documentId,
           `${context} Google API start count ${Math.max(0, Number(startSnapshot.wordCount) || 0)} differed from visible count ${Math.max(0, visibleWordCount)}`
@@ -1138,6 +1175,15 @@
         }
       }
       return startSnapshot;
+    }
+
+    if (!allowVisibleFallback) {
+      return {
+        ...startSnapshot,
+        error: aceIsExtensionContextError(startSnapshot.error)
+          ? `E-CONTEXT-INVALIDATED: ${startSnapshot.error} Reload this Google Doc after reloading the extension.`
+          : `E-EXACT-START-UNAVAILABLE: ${startSnapshot.error || "Google Docs API before snapshot was unavailable."}`
+      };
     }
 
     const visibleSnapshot = await aceVisibleStartSnapshot(
@@ -1160,35 +1206,41 @@
   async function aceSeedGoogleDocStartSnapshotFromBaseline(documentId, extensionSessionId, baseline) {
     const wordCount = aceOptionalWordCount(baseline?.endDocumentWordCount);
     const wordCounts = baseline?.endDocumentWordCounts || baseline?.wordCounts || null;
+    const wordTokens = baseline?.endDocumentWordTokens || baseline?.wordTokens || null;
     if (!documentId || !extensionSessionId || !Number.isFinite(wordCount)) {
       return null;
     }
     const baselineTokenizerVersion = baseline?.endDocumentWordCountTokenizerVersion || baseline?.wordCountTokenizerVersion || "";
-    const hasWordMap = Boolean(wordCounts && baselineTokenizerVersion === ACE_WORD_TOKENIZER_VERSION);
+    const hasWordTokens = Boolean(
+      Array.isArray(wordTokens)
+      && baselineTokenizerVersion === ACE_WORD_TOKENIZER_VERSION
+    );
 
     await aceStorageSet({
       [aceSnapshotStorageKey(extensionSessionId)]: {
         documentId,
         revisionId: baseline.revisionId || "",
         wordCount,
-        wordCounts: hasWordMap ? wordCounts : null,
-        wordCountTokenizerVersion: hasWordMap ? ACE_WORD_TOKENIZER_VERSION : "",
+        wordCounts: hasWordTokens ? wordCounts : null,
+        wordTokens: hasWordTokens ? wordTokens : null,
+        wordCountTokenizerVersion: hasWordTokens ? ACE_WORD_TOKENIZER_VERSION : "",
         createdAt: new Date().toISOString(),
-        source: hasWordMap ? "local-baseline" : "visible-total-baseline"
+        source: hasWordTokens ? "local-baseline" : "visible-total-baseline"
       }
     });
 
     return {
       ok: true,
       status: 200,
-      method: hasWordMap ? "local-baseline" : "visible-total-baseline",
+      method: hasWordTokens ? "local-baseline" : "visible-total-baseline",
       revisionId: baseline.revisionId || "",
       wordCount,
-      wordCounts: hasWordMap ? wordCounts : null,
-      wordCountTokenizerVersion: hasWordMap ? ACE_WORD_TOKENIZER_VERSION : "",
-      wordCountDiagnostic: hasWordMap
+      wordCounts: hasWordTokens ? wordCounts : null,
+      wordTokens: hasWordTokens ? wordTokens : null,
+      wordCountTokenizerVersion: hasWordTokens ? ACE_WORD_TOKENIZER_VERSION : "",
+      wordCountDiagnostic: hasWordTokens
         ? ""
-        : `W-START-SAVED-TOTAL-BASELINE: started from saved total ${wordCount}; exact added/removed split requires a current ${ACE_WORD_TOKENIZER_VERSION} Google API word map.`
+        : `W-START-SAVED-TOTAL-BASELINE: started from saved total ${wordCount}; exact added/removed split requires a current ${ACE_WORD_TOKENIZER_VERSION} Google API token snapshot.`
     };
   }
 
@@ -1327,11 +1379,14 @@
     extensionSessionId,
     startWordCount,
     startRevisionId,
-    hadDocumentActivity
+    hadDocumentActivity,
+    options = {}
   ) {
     await aceDelay(ACE_GOOGLE_DOC_SETTLE_DELAY_MS);
 
     const expectedRevisionChange = Boolean(hadDocumentActivity && startRevisionId);
+    const requireExactWordDiff = Boolean(options.requireExactWordDiff);
+    const allowVisibleFallback = options.allowVisibleFallback !== false && !requireExactWordDiff;
     let bestResponse = {
       ok: false,
       wordCount: null,
@@ -1357,9 +1412,12 @@
       if (!response.ok || !Number.isFinite(response.wordCount)) {
         const visibleWordCount = Number(response.visibleWordCount);
         if (
+          allowVisibleFallback
+          && (
           Number.isFinite(visibleWordCount)
           && visibleWordCount > 0
           && Number.isFinite(startWordCount)
+          )
         ) {
           bestVisibleFallbackResponse = aceVisibleWordCountFallbackResponse(response, {
             attempt: attempt + 1,
@@ -1374,6 +1432,8 @@
         const apiWordCount = Number(response.apiWordCount ?? response.wordCount);
         const apiMatchesVisible = !Number.isFinite(visibleWordCount)
           || Math.max(0, apiWordCount) === Math.max(0, visibleWordCount);
+        const hasExactWordTokens = Array.isArray(response.endWordTokens)
+          && response.wordCountTokenizerVersion === ACE_WORD_TOKENIZER_VERSION;
         const suspiciousZeroWordCount = Number(startWordCount) >= 100
           && Number(apiWordCount) === 0
           && !Number.isFinite(response.visibleWordCount);
@@ -1399,6 +1459,63 @@
               source: "google-api-word-map"
             }),
             error: "E-API-ZERO: Google Docs API returned 0 words for a non-empty document, so I did not save the count. Retry after Google Docs updates its API result."
+          };
+          continue;
+        }
+
+        if (requireExactWordDiff && !hasExactWordTokens) {
+          bestResponse = {
+            ...response,
+            ok: false,
+            wordCount: null,
+            wordsAdded: 0,
+            wordsRemoved: 0,
+            netWordsChanged: 0,
+            wordCountDiagnostic: aceGoogleDocDiffDiagnostic({
+              code: "E-EXACT-END-TOKENS-MISSING",
+              attempt: attempt + 1,
+              startWordCount,
+              apiEndWordCount: apiWordCount,
+              visibleEndWordCount: visibleWordCount,
+              wordsAdded: 0,
+              wordsRemoved: 0,
+              netWordsChanged: 0,
+              startRevisionId,
+              endRevisionId: response.revisionId || "",
+              source: "google-api-token-sequence"
+            }),
+            error: `E-EXACT-END-TOKENS-MISSING: Editing sessions require a current ${ACE_WORD_TOKENIZER_VERSION} Google Docs token snapshot. Reload the doc, wait for the visible word count to settle, then retry sync.`
+          };
+          continue;
+        }
+
+        if (requireExactWordDiff && !apiMatchesVisible) {
+          bestResponse = {
+            ...response,
+            ok: false,
+            wordCount: null,
+            wordsAdded: 0,
+            wordsRemoved: 0,
+            netWordsChanged: 0,
+            wordCountDiagnostic: aceGoogleDocDiffDiagnostic({
+              code: "E-EXACT-END-MISMATCH",
+              attempt: attempt + 1,
+              startWordCount,
+              apiEndWordCount: apiWordCount,
+              visibleEndWordCount: visibleWordCount,
+              wordsAdded: Math.max(0, Number(response.wordsAdded) || 0),
+              wordsRemoved: Math.max(0, Number(response.wordsRemoved) || 0),
+              netWordsChanged: Number.isFinite(startWordCount) ? apiWordCount - startWordCount : 0,
+              revisionChanged: Boolean(
+                startRevisionId
+                && response.revisionId
+                && response.revisionId !== startRevisionId
+              ),
+              startRevisionId,
+              endRevisionId: response.revisionId || "",
+              source: response.wordDiffMethod || "google-api-token-sequence"
+            }),
+            error: `E-EXACT-END-MISMATCH: Google Docs API end count ${Math.max(0, apiWordCount)} does not match the visible count ${Math.max(0, visibleWordCount)}. I did not save an editing breakdown because the API is still stale. Retry shortly.`
           };
           continue;
         }
@@ -1429,7 +1546,7 @@
           revisionChanged,
           startRevisionId,
           endRevisionId: response.revisionId || "",
-          source: response.endWordCounts ? "google-api-word-map" : "api-total-fallback"
+          source: response.wordDiffMethod || (response.endWordTokens ? "google-api-token-sequence" : "api-total-fallback")
         });
         const isBetterResponse = !bestResponse.ok
           || totalActivity > bestActivity
@@ -1469,7 +1586,8 @@
         }
 
         if (
-          !apiMatchesVisible
+          allowVisibleFallback
+          && !apiMatchesVisible
           && Number.isFinite(visibleWordCount)
           && visibleWordCount > 0
         ) {
@@ -1515,6 +1633,35 @@
       + Math.max(0, Number(bestResponse.wordsRemoved) || 0);
 
     if (
+      requireExactWordDiff
+      && hadDocumentActivity
+      && bestResponse.ok
+      && bestTotalActivity === 0
+      && bestNetWordsChanged === 0
+    ) {
+      return {
+        ...bestResponse,
+        ok: false,
+        wordCount: null,
+        wordCountDiagnostic: bestResponse.wordCountDiagnostic || aceGoogleDocDiffDiagnostic({
+          code: "E-EXACT-NO-TOKEN-CHANGE",
+          attempt: bestAttempt,
+          startWordCount,
+          apiEndWordCount: bestResponse.wordCount,
+          visibleEndWordCount: bestResponse.visibleWordCount,
+          wordsAdded: 0,
+          wordsRemoved: 0,
+          netWordsChanged: 0,
+          revisionChanged: bestRevisionChanged,
+          startRevisionId,
+          endRevisionId: bestResponse.revisionId || "",
+          source: bestResponse.wordDiffMethod || "google-api-token-sequence"
+        }),
+        error: "E-EXACT-NO-TOKEN-CHANGE: The editing session had document activity, but the Google Docs before/after token sequence is unchanged. I did not save +0/-0; retry sync after Google Docs finishes saving, or send this diagnostic if the visible count has settled."
+      };
+    }
+
+    if (
       expectedRevisionChange
       && bestResponse.ok
       && bestTotalActivity === 0
@@ -1542,7 +1689,7 @@
           revisionChanged: false,
           startRevisionId,
           endRevisionId: bestResponse.revisionId || "",
-          source: "google-api-word-map"
+          source: bestResponse.wordDiffMethod || "google-api-token-sequence"
         }),
         error: "E-API-NO-CHANGE: Google Docs API still matches the before snapshot after polling. Retry sync, or run a deletion-only/addition-only test and send the diagnostic line."
       };
@@ -1603,6 +1750,80 @@
       .join("|");
   }
 
+  function aceCompareWordTokens(startTokens, endTokens) {
+    const before = Array.isArray(startTokens) ? startTokens : [];
+    const after = Array.isArray(endTokens) ? endTokens : [];
+    let prefixLength = 0;
+    while (
+      prefixLength < before.length
+      && prefixLength < after.length
+      && before[prefixLength] === after[prefixLength]
+    ) {
+      prefixLength += 1;
+    }
+
+    let beforeEnd = before.length;
+    let afterEnd = after.length;
+    while (
+      beforeEnd > prefixLength
+      && afterEnd > prefixLength
+      && before[beforeEnd - 1] === after[afterEnd - 1]
+    ) {
+      beforeEnd -= 1;
+      afterEnd -= 1;
+    }
+
+    const removedTokens = before.slice(prefixLength, beforeEnd);
+    const addedTokens = after.slice(prefixLength, afterEnd);
+    if (!removedTokens.length || !addedTokens.length) {
+      return {
+        wordsAdded: addedTokens.length,
+        wordsRemoved: removedTokens.length,
+        method: "google-api-token-sequence"
+      };
+    }
+
+    const cellCount = removedTokens.length * addedTokens.length;
+    if (cellCount > 2000000) {
+      return {
+        ...aceCompareWordCounts(
+          aceWordCountsFromTokens(removedTokens),
+          aceWordCountsFromTokens(addedTokens)
+        ),
+        method: "google-api-token-map-fallback"
+      };
+    }
+
+    const lcsLength = aceLongestCommonSubsequenceLength(removedTokens, addedTokens);
+    return {
+      wordsAdded: addedTokens.length - lcsLength,
+      wordsRemoved: removedTokens.length - lcsLength,
+      method: "google-api-token-sequence"
+    };
+  }
+
+  function aceWordCountsFromTokens(tokens) {
+    const counts = {};
+    (tokens || []).forEach(function (token) {
+      counts[token] = (counts[token] || 0) + 1;
+    });
+    return counts;
+  }
+
+  function aceLongestCommonSubsequenceLength(before, after) {
+    let previous = new Uint32Array(after.length + 1);
+    for (let beforeIndex = 0; beforeIndex < before.length; beforeIndex += 1) {
+      const current = new Uint32Array(after.length + 1);
+      for (let afterIndex = 0; afterIndex < after.length; afterIndex += 1) {
+        current[afterIndex + 1] = before[beforeIndex] === after[afterIndex]
+          ? previous[afterIndex] + 1
+          : Math.max(previous[afterIndex + 1], current[afterIndex]);
+      }
+      previous = current;
+    }
+    return previous[after.length];
+  }
+
   async function aceGoogleDocWordCountAfterSettle(documentId, baseline) {
     await aceDelay(ACE_GOOGLE_DOC_SETTLE_DELAY_MS);
 
@@ -1611,6 +1832,10 @@
     const baselineWordCounts = baselineTokenizerVersion === ACE_WORD_TOKENIZER_VERSION
       ? baseline?.endDocumentWordCounts || baseline?.wordCounts || null
       : null;
+    const baselineWordTokens = baselineTokenizerVersion === ACE_WORD_TOKENIZER_VERSION
+      ? baseline?.endDocumentWordTokens || baseline?.wordTokens || null
+      : null;
+    const allowVisibleFallback = true;
     let bestResponse = {
       ok: false,
       wordCount: null,
@@ -1636,7 +1861,9 @@
         const apiMatchesVisible = !Number.isFinite(visibleWordCount)
           || Math.max(0, wordCount) === Math.max(0, visibleWordCount);
         const delta = wordCount - baselineWordCount;
-        const diff = aceCompareWordCounts(baselineWordCounts, response.wordCounts, delta);
+        const diff = Array.isArray(baselineWordTokens) && Array.isArray(response.wordTokens)
+          ? aceCompareWordTokens(baselineWordTokens, response.wordTokens)
+          : aceCompareWordCounts(baselineWordCounts, response.wordCounts, delta);
         const enrichedResponse = {
           ...response,
           wordsAdded: diff.wordsAdded,
@@ -1654,7 +1881,7 @@
             revisionChanged: false,
             startRevisionId: "",
             endRevisionId: response.revisionId || "",
-            source: response.wordCounts ? "google-api-word-map" : "api-total-fallback"
+            source: diff.method || (response.wordCounts ? "google-api-word-map" : "api-total-fallback")
           })
         };
         const totalActivity = diff.wordsAdded + diff.wordsRemoved;
@@ -1680,7 +1907,8 @@
         previousSignature = signature;
 
         if (
-          !apiMatchesVisible
+          allowVisibleFallback
+          && !apiMatchesVisible
           && Number.isFinite(visibleWordCount)
           && visibleWordCount > 0
         ) {
@@ -2727,6 +2955,7 @@
         startDocumentWordCount: catchUpStartWordCount,
         endDocumentWordCount: currentWordCount,
         endDocumentWordCounts: currentSnapshot.wordCounts || null,
+        endDocumentWordTokens: currentSnapshot.wordTokens || null,
         wordsWritten: wordsRemoved > 0 ? 0 : wordsAdded,
         wordsAdded,
         wordsRemoved,
@@ -2826,6 +3055,8 @@
         ? startSnapshot.wordCount
         : null,
       startDocumentRevisionId: startSnapshot.revisionId || "",
+      startDocumentWordCountTokenizerVersion: startSnapshot.wordCountTokenizerVersion || "",
+      startDocumentHasWordTokens: aceSnapshotHasExactWordTokens(startSnapshot),
       wordCountMethod: startSnapshot.method || "google-docs-api",
       wordCountError: "",
       wordCountDiagnostic: startSnapshot.wordCountDiagnostic || ""
@@ -2862,15 +3093,23 @@
 
     const extensionSessionId = aceCreateExtensionSessionId(documentId);
     const sessionType = await aceLastSessionType();
+    const requiresExactWordDiff = aceSessionTypeRequiresExactWordDiff(sessionType);
     const startSnapshot = await aceStartSnapshotWithVisibleFallback(
       documentId,
       extensionSessionId,
       true,
-      "manual start"
+      "manual start",
+      { allowVisibleFallback: !requiresExactWordDiff }
     );
     if (!startSnapshot.ok || !Number.isFinite(startSnapshot.wordCount)) {
       aceState = "prompt";
       acePromptError = `Google Docs word count is required. ${startSnapshot.error || "Check Google OAuth and try again."}`;
+      aceRenderPrompt();
+      return;
+    }
+    if (requiresExactWordDiff && !aceSnapshotHasExactWordTokens(startSnapshot)) {
+      aceState = "prompt";
+      acePromptError = aceExactWordDiffStartError(startSnapshot);
       aceRenderPrompt();
       return;
     }
@@ -2922,24 +3161,34 @@
 
       const extensionSessionId = aceCreateExtensionSessionId(documentId);
       const sessionType = await aceLastSessionType();
+      const requiresExactWordDiff = aceSessionTypeRequiresExactWordDiff(sessionType);
       const baseline = await aceGetDocumentBaseline(documentId);
-      let startSnapshot = await aceSeedGoogleDocStartSnapshotFromBaseline(
-        documentId,
-        extensionSessionId,
-        baseline
-      );
+      let startSnapshot = requiresExactWordDiff
+        ? null
+        : await aceSeedGoogleDocStartSnapshotFromBaseline(
+          documentId,
+          extensionSessionId,
+          baseline
+        );
       if (!startSnapshot) {
         startSnapshot = await aceStartSnapshotWithVisibleFallback(
           documentId,
           extensionSessionId,
           false,
-          "auto-start"
+          "auto-start",
+          { allowVisibleFallback: !requiresExactWordDiff }
         );
       }
 
       if (!startSnapshot.ok || !Number.isFinite(startSnapshot.wordCount)) {
         aceState = "prompt";
         acePromptError = `Could not auto-start session. ${startSnapshot.error || "Check Google OAuth and try again."}`;
+        aceRenderPrompt();
+        return;
+      }
+      if (requiresExactWordDiff && !aceSnapshotHasExactWordTokens(startSnapshot)) {
+        aceState = "prompt";
+        acePromptError = aceExactWordDiffStartError(startSnapshot);
         aceRenderPrompt();
         return;
       }
@@ -3097,7 +3346,11 @@
       activeSession.extensionSessionId,
       activeSession.startDocumentWordCount,
       activeSession.startDocumentRevisionId,
-      activeSession.hadDocumentActivity
+      activeSession.hadDocumentActivity,
+      {
+        requireExactWordDiff: aceSessionTypeRequiresExactWordDiff(activeSession.sessionType),
+        allowVisibleFallback: !aceSessionTypeRequiresExactWordDiff(activeSession.sessionType)
+      }
     );
     const endDocumentWordCount = Number.isFinite(wordDiff.wordCount)
       ? wordDiff.wordCount
@@ -3130,7 +3383,7 @@
       ),
       startRevisionId: activeSession.startDocumentRevisionId || "",
       endRevisionId: wordDiff.revisionId || "",
-      source: wordDiff.endWordCounts ? "google-api-word-map" : "api-total-fallback"
+      source: wordDiff.wordDiffMethod || (wordDiff.endWordTokens ? "google-api-token-sequence" : "api-total-fallback")
     });
     aceCompletedSession = {
       documentId: activeSession.documentId || aceExtractDocumentId(),
@@ -3156,6 +3409,7 @@
         ? endDocumentWordCount
         : null,
       endDocumentWordCounts: wordDiff.endWordCounts || null,
+      endDocumentWordTokens: wordDiff.endWordTokens || null,
       endDocumentRevisionId: wordDiff.revisionId || "",
       wordCountTokenizerVersion: wordDiff.wordCountTokenizerVersion || "",
       wordCountMethod: "google-docs-api",
@@ -3625,6 +3879,7 @@
       startDocumentRevisionId: catchUpCandidate.baseline?.revisionId || "",
       endDocumentWordCount: catchUpCandidate.endDocumentWordCount,
       endDocumentWordCounts: catchUpCandidate.endDocumentWordCounts || null,
+      endDocumentWordTokens: catchUpCandidate.endDocumentWordTokens || null,
       endDocumentRevisionId: catchUpCandidate.currentSnapshot?.revisionId || "",
       wordCountTokenizerVersion: catchUpCandidate.currentSnapshot?.wordCountTokenizerVersion || "",
       wordCountMethod: "google-docs-api",
@@ -3769,17 +4024,23 @@
       completedSession.extensionSessionId,
       completedSession.startDocumentWordCount,
       completedSession.startDocumentRevisionId,
-      completedSession.hadDocumentActivity
+      completedSession.hadDocumentActivity,
+      {
+        requireExactWordDiff: aceSessionTypeRequiresExactWordDiff(completedSession.sessionType),
+        allowVisibleFallback: !aceSessionTypeRequiresExactWordDiff(completedSession.sessionType)
+      }
     );
     if (!aceIsCompletedSessionCurrent(completedSessionId)) {
       return false;
     }
 
     if (!wordDiff.ok || !Number.isFinite(wordDiff.wordCount)) {
-      const visibleFallback = await aceVisibleStartSnapshot(
-        completedSession.documentId,
-        wordDiff.error || "retry Google API diff was unavailable"
-      );
+      const visibleFallback = aceSessionTypeRequiresExactWordDiff(completedSession.sessionType)
+        ? null
+        : await aceVisibleStartSnapshot(
+          completedSession.documentId,
+          wordDiff.error || "retry Google API diff was unavailable"
+        );
       if (visibleFallback && Number.isFinite(completedSession.startDocumentWordCount)) {
         const netWordsChanged = visibleFallback.wordCount - completedSession.startDocumentWordCount;
         const wordsAdded = Math.max(0, netWordsChanged);
@@ -3793,6 +4054,7 @@
           netWordsChanged,
           endDocumentWordCount: visibleFallback.wordCount,
           endDocumentWordCounts: null,
+          endDocumentWordTokens: null,
           endDocumentRevisionId: "",
           wordCountTokenizerVersion: "",
           wordCountMethod: "visible-total-fallback",
@@ -3833,7 +4095,7 @@
           ),
           startRevisionId: completedSession.startDocumentRevisionId || "",
           endRevisionId: wordDiff.revisionId || "",
-          source: wordDiff.endWordCounts ? "google-api-word-map" : "api-total-fallback"
+          source: wordDiff.wordDiffMethod || (wordDiff.endWordTokens ? "google-api-token-sequence" : "api-total-fallback")
         })
       };
       await aceMarkSessionUnsynced(`Google Docs count unavailable. ${wordDiff.error || "Try again shortly."}`);
@@ -3855,6 +4117,7 @@
       netWordsChanged,
       endDocumentWordCount: wordDiff.wordCount,
       endDocumentWordCounts: wordDiff.endWordCounts || null,
+      endDocumentWordTokens: wordDiff.endWordTokens || null,
       endDocumentRevisionId: wordDiff.revisionId || "",
       wordCountTokenizerVersion: wordDiff.wordCountTokenizerVersion || "",
       wordCountMethod: "google-docs-api",
@@ -3874,7 +4137,7 @@
         ),
         startRevisionId: completedSession.startDocumentRevisionId || "",
         endRevisionId: wordDiff.revisionId || "",
-        source: wordDiff.endWordCounts ? "google-api-word-map" : "api-total-fallback"
+        source: wordDiff.wordDiffMethod || (wordDiff.endWordTokens ? "google-api-token-sequence" : "api-total-fallback")
       }),
       measurementPending: false
     };
