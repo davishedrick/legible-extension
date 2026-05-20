@@ -5,10 +5,9 @@
   const ACE_APP_URL = ACE_API_BASE_URL;
   const ACE_WIDGET_ID = "ace-widget";
   const ACE_TIMER_INTERVAL_MS = 1000;
-  const ACE_GOOGLE_DOC_SETTLE_DELAY_MS = 500;
-  const ACE_GOOGLE_DOC_POLL_DELAY_MS = 700;
-  const ACE_GOOGLE_DOC_POLL_ATTEMPTS = 6;
-  const ACE_PENDING_ACTIVITY_WINDOW_MS = 15000;
+  const ACE_GOOGLE_DOC_SETTLE_DELAY_MS = 1500;
+  const ACE_GOOGLE_DOC_POLL_DELAY_MS = 1500;
+  const ACE_GOOGLE_DOC_POLL_ATTEMPTS = 12;
   const ACE_ACTIVITY_MESSAGE = "ace-writing-activity";
   const ACE_VISIBLE_WORD_COUNT_MESSAGE = "ace-visible-word-count";
   const ACE_VISIBLE_WORD_COUNT_RESULT_MESSAGE = "ace-visible-word-count-result";
@@ -140,10 +139,7 @@
   let aceIssueStatus = "";
   let aceAutoStartInFlight = false;
   let aceAutoStartBindingMisses = {};
-  let aceTypingWordOpen = false;
-  let aceLastBeforeInputAt = 0;
-  let acePendingEstimatedWordsWritten = 0;
-  let aceLastPendingActivityAt = 0;
+  let aceBaselinePrimeInFlight = false;
 
   if (ACE_IS_TOP_FRAME) {
     if (document.getElementById(ACE_WIDGET_ID)) {
@@ -589,6 +585,75 @@
     });
   }
 
+  async function aceSaveGoogleDocBaseline(documentId, project) {
+    const projectId = String(project?.id || "").trim();
+    if (!documentId || !projectId) {
+      return;
+    }
+
+    const snapshot = await aceGoogleDocWordCount(documentId, false);
+    const wordCount = Number(snapshot?.wordCount);
+    if (!snapshot.ok || !Number.isFinite(wordCount)) {
+      return;
+    }
+
+    const baselines = await aceLocalDocumentBaselines();
+    await aceStorageSet({
+      [ACE_LOCAL_STORAGE.documentBaselines]: {
+        ...baselines,
+        [documentId]: {
+          documentId,
+          projectId,
+          project,
+          endDocumentWordCount: Math.max(0, wordCount),
+          endDocumentWordCounts: snapshot.wordCounts || null,
+          revisionId: snapshot.revisionId || "",
+          syncedAt: new Date().toISOString(),
+          sessionId: ""
+        }
+      }
+    });
+  }
+
+  async function acePrimeBaselineForCurrentDocument() {
+    if (!ACE_IS_TOP_FRAME || aceBaselinePrimeInFlight) {
+      return;
+    }
+
+    const documentId = aceExtractDocumentId();
+    if (!documentId) {
+      return;
+    }
+
+    if (
+      aceState !== "idle"
+      || aceActiveSession
+      || aceCompletedSession
+      || aceCatchUpCandidate
+    ) {
+      return;
+    }
+
+    const existingBaseline = await aceGetDocumentBaseline(documentId);
+    if (existingBaseline?.endDocumentWordCounts && Number.isFinite(Number(existingBaseline.endDocumentWordCount))) {
+      return;
+    }
+
+    aceBaselinePrimeInFlight = true;
+    try {
+      const binding = await aceGetBoundProjectForDocument(documentId);
+      if (!binding?.project) {
+        return;
+      }
+
+      await aceSaveGoogleDocBaseline(documentId, binding.project);
+    } catch (_error) {
+      // A missing non-interactive Google token should not interrupt the document.
+    } finally {
+      aceBaselinePrimeInFlight = false;
+    }
+  }
+
   async function acePostSession(session) {
     const payload = aceSessionSyncPayload(session);
     console.info("[ACE] Syncing extension session payload", payload);
@@ -732,10 +797,6 @@
 
     const visibleWordCount = await aceVisibleGoogleDocWordCount();
     const responseWordCount = Number(response.wordCount);
-    const wordCount = Number.isFinite(visibleWordCount) ? visibleWordCount : responseWordCount;
-    const trustedApiWordCounts = !Number.isFinite(visibleWordCount)
-      || !Number.isFinite(responseWordCount)
-      || Math.max(0, visibleWordCount) === Math.max(0, responseWordCount);
     const wordsAdded = Number(response.wordsAdded);
     const wordsRemoved = Number(response.wordsRemoved);
     const netWordsChanged = Number(response.netWordsChanged);
@@ -743,11 +804,11 @@
       ...response,
       revisionId: response.revisionId || "",
       startRevisionId: response.startRevisionId || "",
-      wordCount: Number.isFinite(wordCount) ? Math.max(0, wordCount) : null,
+      wordCount: Number.isFinite(responseWordCount) ? Math.max(0, responseWordCount) : null,
       apiWordCount: Number.isFinite(responseWordCount) ? Math.max(0, responseWordCount) : null,
       visibleWordCount: Number.isFinite(visibleWordCount) ? Math.max(0, visibleWordCount) : null,
-      wordCounts: trustedApiWordCounts ? response.wordCounts || null : null,
-      endWordCounts: trustedApiWordCounts ? response.endWordCounts || null : null,
+      wordCounts: response.wordCounts || null,
+      endWordCounts: response.endWordCounts || null,
       wordsAdded: Number.isFinite(wordsAdded) ? Math.max(0, wordsAdded) : 0,
       wordsRemoved: Number.isFinite(wordsRemoved) ? Math.max(0, wordsRemoved) : 0,
       netWordsChanged: Number.isFinite(netWordsChanged) ? netWordsChanged : 0
@@ -1088,8 +1149,12 @@
       if (!response.ok || !Number.isFinite(response.wordCount)) {
         bestResponse = response;
       } else {
+        const visibleWordCount = Number(response.visibleWordCount);
+        const apiWordCount = Number(response.apiWordCount ?? response.wordCount);
+        const apiMatchesVisible = !Number.isFinite(visibleWordCount)
+          || Math.max(0, apiWordCount) === Math.max(0, visibleWordCount);
         const suspiciousZeroWordCount = Number(startWordCount) >= 100
-          && Number(response.apiWordCount) === 0
+          && Number(apiWordCount) === 0
           && !Number.isFinite(response.visibleWordCount);
         if (suspiciousZeroWordCount) {
           bestResponse = {
@@ -1104,18 +1169,24 @@
           continue;
         }
 
+        if (!apiMatchesVisible) {
+          bestResponse = {
+            ...response,
+            ok: false,
+            wordCount: null,
+            wordsAdded: 0,
+            wordsRemoved: 0,
+            netWordsChanged: 0,
+            error: "Google Docs API has not caught up to the visible document word count yet. Retry shortly."
+          };
+          continue;
+        }
+
         const delta = Number.isFinite(startWordCount)
           ? response.wordCount - startWordCount
           : 0;
-        const trustedApiDiff = !Number.isFinite(response.visibleWordCount)
-          || !Number.isFinite(response.apiWordCount)
-          || Math.max(0, response.visibleWordCount) === Math.max(0, response.apiWordCount);
-        const wordsAdded = trustedApiDiff
-          ? Math.max(0, Number(response.wordsAdded) || 0)
-          : Math.max(0, delta);
-        const wordsRemoved = trustedApiDiff
-          ? Math.max(0, Number(response.wordsRemoved) || 0)
-          : Math.max(0, -delta);
+        const wordsAdded = Math.max(0, Number(response.wordsAdded) || 0);
+        const wordsRemoved = Math.max(0, Number(response.wordsRemoved) || 0);
         const totalActivity = wordsAdded + wordsRemoved;
         const netMagnitude = Math.abs(delta);
         const revisionChanged = Boolean(
@@ -1617,8 +1688,6 @@
       : "";
     const methodCopy = aceCompletedSession?.measurementPending
       ? '<div class="ace-project-copy">Waiting on Google Docs word count.</div>'
-      : aceCompletedSession?.wordCountMethod === "event-estimate"
-        ? '<div class="ace-project-copy">Words estimated from typing activity.</div>'
       : '<div class="ace-project-copy">Words measured from Google Docs.</div>';
     const wordCountError = aceShortDiagnostic(aceCompletedSession?.wordCountError);
     const diagnosticCopy = wordCountError
@@ -2364,8 +2433,7 @@
     sessionType,
     startSnapshot,
     projectId = "",
-    hadDocumentActivity = false,
-    estimatedWordsWritten = 0
+    hadDocumentActivity = false
   }) {
     const now = new Date().toISOString();
     acePromptError = "";
@@ -2382,8 +2450,7 @@
       wordsAdded: 0,
       wordsRemoved: 0,
       netWordsChanged: 0,
-      estimatedWordsWritten: Math.max(0, Number(estimatedWordsWritten) || 0),
-      hadDocumentActivity: Boolean(hadDocumentActivity || estimatedWordsWritten > 0),
+      hadDocumentActivity: Boolean(hadDocumentActivity),
       startDocumentWordCount: Number.isFinite(startSnapshot.wordCount)
         ? startSnapshot.wordCount
         : null,
@@ -2435,8 +2502,7 @@
       documentId,
       extensionSessionId,
       sessionType,
-      startSnapshot,
-      estimatedWordsWritten: aceConsumePendingEstimatedWords()
+      startSnapshot
     });
   }
 
@@ -2512,8 +2578,7 @@
         sessionType,
         startSnapshot,
         projectId: binding.projectId,
-        hadDocumentActivity: true,
-        estimatedWordsWritten: aceConsumePendingEstimatedWords()
+        hadDocumentActivity: true
       });
     } catch (error) {
       if (aceState === "starting") {
@@ -2655,39 +2720,16 @@
     const endDocumentWordCount = Number.isFinite(wordDiff.wordCount)
       ? wordDiff.wordCount
       : null;
-    let wordsAdded = Math.max(0, Number(wordDiff.wordsAdded) || 0);
-    let wordsRemoved = Math.max(0, Number(wordDiff.wordsRemoved) || 0);
-    let netWordsChanged = Number.isFinite(wordDiff.netWordsChanged)
+    const wordsAdded = Math.max(0, Number(wordDiff.wordsAdded) || 0);
+    const wordsRemoved = Math.max(0, Number(wordDiff.wordsRemoved) || 0);
+    const netWordsChanged = Number.isFinite(wordDiff.netWordsChanged)
       ? wordDiff.netWordsChanged
       : Number.isFinite(activeSession.startDocumentWordCount) && Number.isFinite(endDocumentWordCount)
         ? endDocumentWordCount - activeSession.startDocumentWordCount
         : 0;
-    let measuredWordsWritten = Math.max(0, netWordsChanged);
-    let measuredWordsEdited = wordsAdded + wordsRemoved;
-    let measurementPending = !wordDiff.ok || !Number.isFinite(endDocumentWordCount);
-    let resolvedEndDocumentWordCount = endDocumentWordCount;
-    let wordCountMethod = "google-docs-api";
-    const estimatedWordsWritten = Math.max(0, Number(activeSession.estimatedWordsWritten) || 0);
-    const shouldUseWritingEstimate = activeSession.sessionType === "writing"
-      && estimatedWordsWritten > 0
-      && (measurementPending || measuredWordsWritten === 0);
-    const shouldUseEditingEstimate = activeSession.sessionType === "editing"
-      && estimatedWordsWritten > 0
-      && (measurementPending || measuredWordsEdited === 0);
-    if (shouldUseWritingEstimate || shouldUseEditingEstimate) {
-      wordsAdded = Math.max(wordsAdded, estimatedWordsWritten);
-      wordsRemoved = 0;
-      measuredWordsEdited = wordsAdded;
-      netWordsChanged = wordsAdded;
-      if (shouldUseWritingEstimate) {
-        measuredWordsWritten = estimatedWordsWritten;
-      }
-      measurementPending = false;
-      wordCountMethod = "event-estimate";
-      if (Number.isFinite(activeSession.startDocumentWordCount)) {
-        resolvedEndDocumentWordCount = activeSession.startDocumentWordCount + netWordsChanged;
-      }
-    }
+    const measuredWordsWritten = Math.max(0, netWordsChanged);
+    const measuredWordsEdited = wordsAdded + wordsRemoved;
+    const measurementPending = !wordDiff.ok || !Number.isFinite(endDocumentWordCount);
     const wordCountError = measurementPending
       ? wordDiff.error || "Google Docs word count unavailable."
       : "";
@@ -2707,17 +2749,16 @@
       wordsAdded: measurementPending ? 0 : wordsAdded,
       wordsRemoved: measurementPending ? 0 : wordsRemoved,
       netWordsChanged: measurementPending ? 0 : netWordsChanged,
-      estimatedWordsWritten,
       startDocumentWordCount: Number.isFinite(activeSession.startDocumentWordCount)
         ? activeSession.startDocumentWordCount
         : null,
       startDocumentRevisionId: activeSession.startDocumentRevisionId || "",
-      endDocumentWordCount: Number.isFinite(resolvedEndDocumentWordCount)
-        ? resolvedEndDocumentWordCount
+      endDocumentWordCount: Number.isFinite(endDocumentWordCount)
+        ? endDocumentWordCount
         : null,
       endDocumentWordCounts: wordDiff.endWordCounts || null,
       endDocumentRevisionId: wordDiff.revisionId || "",
-      wordCountMethod,
+      wordCountMethod: "google-docs-api",
       wordCountError,
       hadDocumentActivity: Boolean(activeSession.hadDocumentActivity),
       measurementPending
@@ -2755,7 +2796,6 @@
       wordsAdded: 0,
       wordsRemoved: 0,
       netWordsChanged: 0,
-      estimatedWordsWritten: Math.max(0, Number(activeSession.estimatedWordsWritten) || 0),
       startDocumentWordCount: Number.isFinite(activeSession.startDocumentWordCount)
         ? activeSession.startDocumentWordCount
         : null,
@@ -3390,123 +3430,28 @@
     return event.key === "Unidentified" || event.code.startsWith("Key") || event.code.startsWith("Digit");
   }
 
-  function aceRegisterWritingActivity(event) {
-    const estimatedWords = aceEstimateWritingActivityWords(event);
-    aceNoteActiveDocumentActivity(estimatedWords);
+  function aceRegisterWritingActivity() {
+    aceNoteActiveDocumentActivity();
 
     if (ACE_IS_TOP_FRAME) {
       aceRunAsync(aceTrackOrPromptFromActivity(), "track or prompt from document activity");
       return;
     }
 
-    window.top.postMessage({ aceType: ACE_ACTIVITY_MESSAGE, estimatedWords }, "*");
+    window.top.postMessage({ aceType: ACE_ACTIVITY_MESSAGE }, "*");
   }
 
-  function aceRememberPendingEstimatedWords(estimatedWords) {
-    const words = Math.max(0, Number(estimatedWords) || 0);
-    if (!words) {
-      return;
-    }
-
-    acePendingEstimatedWordsWritten += words;
-    aceLastPendingActivityAt = Date.now();
-  }
-
-  function aceConsumePendingEstimatedWords() {
-    const isRecent = Date.now() - aceLastPendingActivityAt <= ACE_PENDING_ACTIVITY_WINDOW_MS;
-    const words = isRecent ? Math.max(0, Number(acePendingEstimatedWordsWritten) || 0) : 0;
-    acePendingEstimatedWordsWritten = 0;
-    aceLastPendingActivityAt = 0;
-    return words;
-  }
-
-  function aceNoteActiveDocumentActivity(estimatedWords = 0) {
-    if (!aceActiveSession) {
-      aceRememberPendingEstimatedWords(estimatedWords);
-      return;
-    }
-
+  function aceNoteActiveDocumentActivity() {
     if (
       (aceState !== "active" && aceState !== "active-minimized")
+      || !aceActiveSession
       || aceActiveSession.hadDocumentActivity
     ) {
-      if (estimatedWords > 0) {
-        aceActiveSession.estimatedWordsWritten = Math.max(0, Number(aceActiveSession.estimatedWordsWritten) || 0) + estimatedWords;
-        aceRunAsync(acePersistActiveSession(), "persist estimated word activity");
-      }
       return;
     }
 
     aceActiveSession.hadDocumentActivity = true;
-    if (estimatedWords > 0) {
-      aceActiveSession.estimatedWordsWritten = Math.max(0, Number(aceActiveSession.estimatedWordsWritten) || 0) + estimatedWords;
-    }
     aceRunAsync(acePersistActiveSession(), "persist document activity");
-  }
-
-  function aceEstimateWritingActivityWords(event) {
-    if (!event) {
-      return 0;
-    }
-
-    if (event.type === "input" && Date.now() - aceLastBeforeInputAt < 100) {
-      return 0;
-    }
-
-    if (event.type === "beforeinput") {
-      aceLastBeforeInputAt = Date.now();
-    }
-
-    const inputType = String(event.inputType || "");
-    if (inputType.startsWith("delete")) {
-      aceTypingWordOpen = false;
-      return 0;
-    }
-
-    if (inputType && !inputType.startsWith("insert")) {
-      return 0;
-    }
-
-    if (event.type === "paste" && event.clipboardData?.getData) {
-      return aceEstimateInsertedWords(event.clipboardData.getData("text/plain"));
-    }
-
-    if (typeof event.data === "string") {
-      return aceEstimateInsertedWords(event.data);
-    }
-
-    if (event.type === "keydown") {
-      if (event.key === "Backspace" || event.key === "Delete") {
-        aceTypingWordOpen = false;
-        return 0;
-      }
-      if (event.key === "Enter" || event.key === " ") {
-        aceTypingWordOpen = false;
-        return 0;
-      }
-      if (event.key?.length === 1) {
-        return aceEstimateInsertedWords(event.key);
-      }
-    }
-
-    return 0;
-  }
-
-  function aceEstimateInsertedWords(text) {
-    const value = String(text || "");
-    const tokens = value.match(/[\p{L}\p{N}]+/gu) || [];
-    if (!tokens.length) {
-      if (/\s/u.test(value)) {
-        aceTypingWordOpen = false;
-      }
-      return 0;
-    }
-
-    const startsWithWord = /^[\p{L}\p{N}]/u.test(value);
-    const endsWithWord = /[\p{L}\p{N}]$/u.test(value);
-    const overlap = startsWithWord && aceTypingWordOpen ? 1 : 0;
-    aceTypingWordOpen = endsWithWord;
-    return Math.max(0, tokens.length - overlap);
   }
 
   function aceSchedulePrompt() {
@@ -3522,7 +3467,7 @@
       return;
     }
 
-    aceRegisterWritingActivity(event);
+    aceRegisterWritingActivity();
   }
 
   function aceHandleInputLikeActivity(event) {
@@ -3534,15 +3479,15 @@
       return;
     }
 
-    aceRegisterWritingActivity(event);
+    aceRegisterWritingActivity();
   }
 
-  function aceHandleClipboardActivity(event) {
+  function aceHandleClipboardActivity() {
     if (aceWidget?.contains(document.activeElement)) {
       return;
     }
 
-    aceRegisterWritingActivity(event);
+    aceRegisterWritingActivity();
   }
 
   function aceGetAnchorPoint(position) {
@@ -3831,7 +3776,7 @@
         return;
       }
 
-      aceNoteActiveDocumentActivity(Math.max(0, Number(event.data.estimatedWords) || 0));
+      aceNoteActiveDocumentActivity();
       aceRunAsync(aceTrackOrPromptFromActivity(), "track or prompt from document activity");
     });
 
@@ -3849,7 +3794,12 @@
     window.addEventListener("pagehide", aceHandleDocumentExit);
     window.addEventListener("beforeunload", aceHandleDocumentExit);
 
-    aceRunAsync(aceRestoreSession(), "restore session");
+    aceRunAsync(aceInitializeSessionState(), "initialize session state");
+  }
+
+  async function aceInitializeSessionState() {
+    await aceRestoreSession();
+    await acePrimeBaselineForCurrentDocument();
   }
 
   function aceHandleDocumentExit() {
