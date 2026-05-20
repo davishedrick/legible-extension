@@ -8,6 +8,7 @@
   const ACE_GOOGLE_DOC_SETTLE_DELAY_MS = 500;
   const ACE_GOOGLE_DOC_POLL_DELAY_MS = 700;
   const ACE_GOOGLE_DOC_POLL_ATTEMPTS = 6;
+  const ACE_PENDING_ACTIVITY_WINDOW_MS = 15000;
   const ACE_ACTIVITY_MESSAGE = "ace-writing-activity";
   const ACE_VISIBLE_WORD_COUNT_MESSAGE = "ace-visible-word-count";
   const ACE_VISIBLE_WORD_COUNT_RESULT_MESSAGE = "ace-visible-word-count-result";
@@ -141,6 +142,8 @@
   let aceAutoStartBindingMisses = {};
   let aceTypingWordOpen = false;
   let aceLastBeforeInputAt = 0;
+  let acePendingEstimatedWordsWritten = 0;
+  let aceLastPendingActivityAt = 0;
 
   if (ACE_IS_TOP_FRAME) {
     if (document.getElementById(ACE_WIDGET_ID)) {
@@ -1614,6 +1617,8 @@
       : "";
     const methodCopy = aceCompletedSession?.measurementPending
       ? '<div class="ace-project-copy">Waiting on Google Docs word count.</div>'
+      : aceCompletedSession?.wordCountMethod === "event-estimate"
+        ? '<div class="ace-project-copy">Words estimated from typing activity.</div>'
       : '<div class="ace-project-copy">Words measured from Google Docs.</div>';
     const wordCountError = aceShortDiagnostic(aceCompletedSession?.wordCountError);
     const diagnosticCopy = wordCountError
@@ -2359,7 +2364,8 @@
     sessionType,
     startSnapshot,
     projectId = "",
-    hadDocumentActivity = false
+    hadDocumentActivity = false,
+    estimatedWordsWritten = 0
   }) {
     const now = new Date().toISOString();
     acePromptError = "";
@@ -2376,8 +2382,8 @@
       wordsAdded: 0,
       wordsRemoved: 0,
       netWordsChanged: 0,
-      estimatedWordsWritten: 0,
-      hadDocumentActivity: Boolean(hadDocumentActivity),
+      estimatedWordsWritten: Math.max(0, Number(estimatedWordsWritten) || 0),
+      hadDocumentActivity: Boolean(hadDocumentActivity || estimatedWordsWritten > 0),
       startDocumentWordCount: Number.isFinite(startSnapshot.wordCount)
         ? startSnapshot.wordCount
         : null,
@@ -2429,7 +2435,8 @@
       documentId,
       extensionSessionId,
       sessionType,
-      startSnapshot
+      startSnapshot,
+      estimatedWordsWritten: aceConsumePendingEstimatedWords()
     });
   }
 
@@ -2505,7 +2512,8 @@
         sessionType,
         startSnapshot,
         projectId: binding.projectId,
-        hadDocumentActivity: true
+        hadDocumentActivity: true,
+        estimatedWordsWritten: aceConsumePendingEstimatedWords()
       });
     } catch (error) {
       if (aceState === "starting") {
@@ -2663,16 +2671,21 @@
     const shouldUseWritingEstimate = activeSession.sessionType === "writing"
       && estimatedWordsWritten > 0
       && (measurementPending || measuredWordsWritten === 0);
-    if (shouldUseWritingEstimate) {
-      measuredWordsWritten = estimatedWordsWritten;
+    const shouldUseEditingEstimate = activeSession.sessionType === "editing"
+      && estimatedWordsWritten > 0
+      && (measurementPending || measuredWordsEdited === 0);
+    if (shouldUseWritingEstimate || shouldUseEditingEstimate) {
       wordsAdded = Math.max(wordsAdded, estimatedWordsWritten);
       wordsRemoved = 0;
-      netWordsChanged = estimatedWordsWritten;
       measuredWordsEdited = wordsAdded;
+      netWordsChanged = wordsAdded;
+      if (shouldUseWritingEstimate) {
+        measuredWordsWritten = estimatedWordsWritten;
+      }
       measurementPending = false;
       wordCountMethod = "event-estimate";
       if (Number.isFinite(activeSession.startDocumentWordCount)) {
-        resolvedEndDocumentWordCount = activeSession.startDocumentWordCount + estimatedWordsWritten;
+        resolvedEndDocumentWordCount = activeSession.startDocumentWordCount + netWordsChanged;
       }
     }
     const wordCountError = measurementPending
@@ -3389,13 +3402,35 @@
     window.top.postMessage({ aceType: ACE_ACTIVITY_MESSAGE, estimatedWords }, "*");
   }
 
+  function aceRememberPendingEstimatedWords(estimatedWords) {
+    const words = Math.max(0, Number(estimatedWords) || 0);
+    if (!words) {
+      return;
+    }
+
+    acePendingEstimatedWordsWritten += words;
+    aceLastPendingActivityAt = Date.now();
+  }
+
+  function aceConsumePendingEstimatedWords() {
+    const isRecent = Date.now() - aceLastPendingActivityAt <= ACE_PENDING_ACTIVITY_WINDOW_MS;
+    const words = isRecent ? Math.max(0, Number(acePendingEstimatedWordsWritten) || 0) : 0;
+    acePendingEstimatedWordsWritten = 0;
+    aceLastPendingActivityAt = 0;
+    return words;
+  }
+
   function aceNoteActiveDocumentActivity(estimatedWords = 0) {
+    if (!aceActiveSession) {
+      aceRememberPendingEstimatedWords(estimatedWords);
+      return;
+    }
+
     if (
       (aceState !== "active" && aceState !== "active-minimized")
-      || !aceActiveSession
       || aceActiveSession.hadDocumentActivity
     ) {
-      if (estimatedWords > 0 && aceActiveSession) {
+      if (estimatedWords > 0) {
         aceActiveSession.estimatedWordsWritten = Math.max(0, Number(aceActiveSession.estimatedWordsWritten) || 0) + estimatedWords;
         aceRunAsync(acePersistActiveSession(), "persist estimated word activity");
       }
