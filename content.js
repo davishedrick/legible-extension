@@ -1150,6 +1150,46 @@
     return `${code}: start ${Number.isFinite(Number(startWordCount)) ? Number(startWordCount) : "unknown"}; API end ${Number.isFinite(Number(apiEndWordCount)) ? Number(apiEndWordCount) : "unknown"}; visible end ${visibleCopy}; added +${Math.max(0, Number(wordsAdded) || 0)}; removed -${Math.max(0, Number(wordsRemoved) || 0)}; net ${aceFormatSignedNumber(netWordsChanged)}; revision ${revisionCopy}; attempt ${attemptCopy}; source ${source}.`;
   }
 
+  function aceVisibleWordCountFallbackResponse(response, {
+    attempt = 0,
+    startWordCount = null,
+    startRevisionId = "",
+    revisionChanged = false
+  } = {}) {
+    const visibleWordCount = Number(response?.visibleWordCount);
+    const apiWordCount = Number(response?.apiWordCount ?? response?.wordCount);
+    const netWordsChanged = Number.isFinite(startWordCount) && Number.isFinite(visibleWordCount)
+      ? visibleWordCount - startWordCount
+      : 0;
+    const wordsAdded = Math.max(0, netWordsChanged);
+    const wordsRemoved = Math.max(0, -netWordsChanged);
+
+    return {
+      ...response,
+      ok: true,
+      wordCount: Math.max(0, visibleWordCount),
+      wordsAdded,
+      wordsRemoved,
+      netWordsChanged,
+      wordCounts: null,
+      endWordCounts: null,
+      wordCountDiagnostic: aceGoogleDocDiffDiagnostic({
+        code: "W-VISIBLE-FALLBACK",
+        attempt,
+        startWordCount,
+        apiEndWordCount: apiWordCount,
+        visibleEndWordCount: visibleWordCount,
+        wordsAdded,
+        wordsRemoved,
+        netWordsChanged,
+        revisionChanged,
+        startRevisionId,
+        endRevisionId: response?.revisionId || "",
+        source: "visible-total-fallback"
+      })
+    };
+  }
+
   async function aceGoogleDocDiffAfterSave(
     documentId,
     extensionSessionId,
@@ -1186,6 +1226,8 @@
       } else {
         const visibleWordCount = Number(response.visibleWordCount);
         const apiWordCount = Number(response.apiWordCount ?? response.wordCount);
+        const apiMatchesVisible = !Number.isFinite(visibleWordCount)
+          || Math.max(0, apiWordCount) === Math.max(0, visibleWordCount);
         const suspiciousZeroWordCount = Number(startWordCount) >= 100
           && Number(apiWordCount) === 0
           && !Number.isFinite(response.visibleWordCount);
@@ -1262,7 +1304,10 @@
           bestAttempt = attempt + 1;
         }
 
-        if (totalActivity > 0 || delta !== 0 || revisionChanged || !expectedRevisionChange) {
+        if (
+          apiMatchesVisible
+          && (totalActivity > 0 || delta !== 0 || revisionChanged || !expectedRevisionChange)
+        ) {
           console.info("[ACE] Selected Google Docs word diff", {
             attempt: attempt + 1,
             revisionChanged,
@@ -1281,6 +1326,36 @@
       if (attempt < ACE_GOOGLE_DOC_POLL_ATTEMPTS - 1) {
         await aceDelay(ACE_GOOGLE_DOC_POLL_DELAY_MS);
       }
+    }
+
+    const fallbackVisibleWordCount = Number(bestResponse.visibleWordCount);
+    const fallbackApiWordCount = Number(bestResponse.apiWordCount ?? bestResponse.wordCount);
+    if (
+      bestResponse.ok
+      && Number.isFinite(fallbackVisibleWordCount)
+      && Math.max(0, fallbackVisibleWordCount) !== Math.max(0, fallbackApiWordCount)
+    ) {
+      const fallbackResponse = aceVisibleWordCountFallbackResponse(bestResponse, {
+        attempt: bestAttempt,
+        startWordCount,
+        startRevisionId,
+        revisionChanged: Boolean(
+          startRevisionId
+          && bestResponse.revisionId
+          && bestResponse.revisionId !== startRevisionId
+        )
+      });
+      console.info("[ACE] Selected visible word count fallback", {
+        attempt: bestAttempt,
+        startWordCount,
+        apiEndWordCount: fallbackApiWordCount,
+        visibleEndWordCount: fallbackVisibleWordCount,
+        wordsAdded: fallbackResponse.wordsAdded,
+        wordsRemoved: fallbackResponse.wordsRemoved,
+        netWordsChanged: fallbackResponse.netWordsChanged,
+        wordCountDiagnostic: fallbackResponse.wordCountDiagnostic
+      });
+      return fallbackResponse;
     }
 
     if (expectedRevisionChange && bestResponse.ok) {
