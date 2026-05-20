@@ -1203,6 +1203,40 @@
     };
   }
 
+  function aceVisibleCatchUpFallbackResponse(response, baselineWordCount, attempt = 0) {
+    const visibleWordCount = Number(response?.visibleWordCount);
+    const apiWordCount = Number(response?.apiWordCount ?? response?.wordCount);
+    const netWordsChanged = Number.isFinite(visibleWordCount)
+      ? visibleWordCount - baselineWordCount
+      : 0;
+    const wordsAdded = Math.max(0, netWordsChanged);
+    const wordsRemoved = Math.max(0, -netWordsChanged);
+
+    return {
+      ...response,
+      ok: true,
+      wordCount: Math.max(0, visibleWordCount),
+      wordsAdded,
+      wordsRemoved,
+      netWordsChanged,
+      wordCounts: null,
+      wordCountDiagnostic: aceGoogleDocDiffDiagnostic({
+        code: "W-CATCHUP-VISIBLE-FALLBACK",
+        attempt,
+        startWordCount: baselineWordCount,
+        apiEndWordCount: apiWordCount,
+        visibleEndWordCount: visibleWordCount,
+        wordsAdded,
+        wordsRemoved,
+        netWordsChanged,
+        revisionChanged: false,
+        startRevisionId: "",
+        endRevisionId: response?.revisionId || "",
+        source: "visible-total-fallback"
+      })
+    };
+  }
+
   async function aceGoogleDocDiffAfterSave(
     documentId,
     extensionSessionId,
@@ -1489,6 +1523,7 @@
     let bestNetMagnitude = Number.NEGATIVE_INFINITY;
     let previousSignature = "";
     let stableSnapshots = 0;
+    let bestVisibleFallbackResponse = null;
 
     for (let attempt = 0; attempt < ACE_GOOGLE_DOC_POLL_ATTEMPTS; attempt += 1) {
       const response = await aceGoogleDocWordCount(documentId, attempt === 0);
@@ -1496,13 +1531,30 @@
       if (!response.ok || !Number.isFinite(wordCount)) {
         bestResponse = response;
       } else {
+        const visibleWordCount = Number(response.visibleWordCount);
+        const apiMatchesVisible = !Number.isFinite(visibleWordCount)
+          || Math.max(0, wordCount) === Math.max(0, visibleWordCount);
         const delta = wordCount - baselineWordCount;
         const diff = aceCompareWordCounts(baselineWordCounts, response.wordCounts, delta);
         const enrichedResponse = {
           ...response,
           wordsAdded: diff.wordsAdded,
           wordsRemoved: diff.wordsRemoved,
-          netWordsChanged: delta
+          netWordsChanged: delta,
+          wordCountDiagnostic: aceGoogleDocDiffDiagnostic({
+            code: apiMatchesVisible ? "D-CATCHUP-API" : "D-CATCHUP-VISIBLE-MISMATCH",
+            attempt: attempt + 1,
+            startWordCount: baselineWordCount,
+            apiEndWordCount: wordCount,
+            visibleEndWordCount: visibleWordCount,
+            wordsAdded: diff.wordsAdded,
+            wordsRemoved: diff.wordsRemoved,
+            netWordsChanged: delta,
+            revisionChanged: false,
+            startRevisionId: "",
+            endRevisionId: response.revisionId || "",
+            source: response.wordCounts ? "google-api-word-map" : "api-total-fallback"
+          })
         };
         const totalActivity = diff.wordsAdded + diff.wordsRemoved;
         const netMagnitude = Math.abs(delta);
@@ -1526,14 +1578,28 @@
           : 0;
         previousSignature = signature;
 
-        if (stableSnapshots >= 1) {
+        if (
+          !apiMatchesVisible
+          && Number.isFinite(visibleWordCount)
+          && visibleWordCount > 0
+        ) {
+          bestVisibleFallbackResponse = aceVisibleCatchUpFallbackResponse(
+            response,
+            baselineWordCount,
+            attempt + 1
+          );
+        }
+
+        if (apiMatchesVisible && stableSnapshots >= 1) {
           console.info("[ACE] Selected stable Google Docs catch-up word count", {
             attempt: attempt + 1,
             baselineWordCount,
             currentWordCount: bestResponse.wordCount,
+            visibleWordCount,
             wordsAdded: bestResponse.wordsAdded,
             wordsRemoved: bestResponse.wordsRemoved,
-            netWordsChanged: bestResponse.netWordsChanged
+            netWordsChanged: bestResponse.netWordsChanged,
+            wordCountDiagnostic: bestResponse.wordCountDiagnostic || ""
           });
           return bestResponse;
         }
@@ -1544,14 +1610,30 @@
       }
     }
 
+    if (bestVisibleFallbackResponse) {
+      console.info("[ACE] Selected visible catch-up word count fallback", {
+        baselineWordCount,
+        currentWordCount: bestVisibleFallbackResponse.wordCount,
+        apiWordCount: bestVisibleFallbackResponse.apiWordCount,
+        visibleWordCount: bestVisibleFallbackResponse.visibleWordCount,
+        wordsAdded: bestVisibleFallbackResponse.wordsAdded,
+        wordsRemoved: bestVisibleFallbackResponse.wordsRemoved,
+        netWordsChanged: bestVisibleFallbackResponse.netWordsChanged,
+        wordCountDiagnostic: bestVisibleFallbackResponse.wordCountDiagnostic
+      });
+      return bestVisibleFallbackResponse;
+    }
+
     console.info("[ACE] Selected Google Docs catch-up word count", {
       baselineWordCount,
       currentWordCount: bestResponse.wordCount,
+      visibleWordCount: bestResponse.visibleWordCount,
       wordsAdded: Math.max(0, Number(bestResponse.wordsAdded) || 0),
       wordsRemoved: Math.max(0, Number(bestResponse.wordsRemoved) || 0),
       netWordsChanged: Number.isFinite(Number(bestResponse.netWordsChanged))
         ? Number(bestResponse.netWordsChanged)
-        : 0
+        : 0,
+      wordCountDiagnostic: bestResponse.wordCountDiagnostic || ""
     });
     return bestResponse;
   }
@@ -1684,6 +1766,10 @@
     const statusCopy = aceSyncStatus
       ? `<div class="ace-sync-copy ace-sync-copy--${aceSyncStatus}">${aceEscapeHtml(aceSyncMessage)}</div>`
       : "";
+    const diagnostic = aceShortDiagnostic(aceCatchUpCandidate?.currentSnapshot?.wordCountDiagnostic, 240);
+    const diagnosticCopy = diagnostic
+      ? `<div class="ace-project-copy">Diagnostic: ${aceEscapeHtml(diagnostic)}</div>`
+      : "";
     aceWidget.className = "ace-widget ace-widget--catch-up";
     aceWidget.innerHTML = `
       ${aceCloseButtonHtml()}
@@ -1695,6 +1781,7 @@
         <input type="text" inputmode="numeric" autocomplete="off" data-ace-catch-up-word-count value="${Number.isFinite(endWordCount) ? aceEscapeHtml(aceFormatNumber(endWordCount)) : ""}">
       </label>
       <div class="ace-project-copy">Change the count if Google Docs shows something different. This creates a 1 min ${sessionTypeCopy} session.</div>
+      ${diagnosticCopy}
       ${statusCopy}
       <div class="ace-actions">
         <button class="ace-button ace-button--primary" type="button" data-ace-action="add-catch-up">Log catch-up</button>
