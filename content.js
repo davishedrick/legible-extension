@@ -1098,9 +1098,37 @@
     };
   }
 
+  async function aceStoreVisibleStartSnapshot(documentId, extensionSessionId, visibleSnapshot) {
+    await aceStorageSet({
+      [aceSnapshotStorageKey(extensionSessionId)]: {
+        documentId,
+        revisionId: "",
+        wordCount: visibleSnapshot.wordCount,
+        wordCounts: null,
+        createdAt: new Date().toISOString(),
+        source: "visible-total-baseline"
+      }
+    });
+  }
+
   async function aceStartSnapshotWithVisibleFallback(documentId, extensionSessionId, interactive, context) {
     const startSnapshot = await aceGoogleDocStartSnapshot(documentId, extensionSessionId, interactive);
     if (startSnapshot.ok && Number.isFinite(startSnapshot.wordCount)) {
+      const visibleWordCount = Number(startSnapshot.visibleWordCount);
+      if (
+        Number.isFinite(visibleWordCount)
+        && visibleWordCount > 0
+        && Math.max(0, visibleWordCount) !== Math.max(0, Number(startSnapshot.wordCount))
+      ) {
+        const visibleSnapshot = await aceVisibleStartSnapshot(
+          documentId,
+          `${context} Google API start count ${Math.max(0, Number(startSnapshot.wordCount) || 0)} differed from visible count ${Math.max(0, visibleWordCount)}`
+        );
+        if (visibleSnapshot) {
+          await aceStoreVisibleStartSnapshot(documentId, extensionSessionId, visibleSnapshot);
+          return visibleSnapshot;
+        }
+      }
       return startSnapshot;
     }
 
@@ -1109,16 +1137,7 @@
       startSnapshot.error || `${context} Google API start snapshot was unavailable`
     );
     if (visibleSnapshot) {
-      await aceStorageSet({
-        [aceSnapshotStorageKey(extensionSessionId)]: {
-          documentId,
-          revisionId: "",
-          wordCount: visibleSnapshot.wordCount,
-          wordCounts: null,
-          createdAt: new Date().toISOString(),
-          source: "visible-total-baseline"
-        }
-      });
+      await aceStoreVisibleStartSnapshot(documentId, extensionSessionId, visibleSnapshot);
       return visibleSnapshot;
     }
 
@@ -1133,27 +1152,32 @@
   async function aceSeedGoogleDocStartSnapshotFromBaseline(documentId, extensionSessionId, baseline) {
     const wordCount = aceOptionalWordCount(baseline?.endDocumentWordCount);
     const wordCounts = baseline?.endDocumentWordCounts || baseline?.wordCounts || null;
-    if (!documentId || !extensionSessionId || !Number.isFinite(wordCount) || !wordCounts) {
+    if (!documentId || !extensionSessionId || !Number.isFinite(wordCount)) {
       return null;
     }
+    const hasWordMap = Boolean(wordCounts);
 
     await aceStorageSet({
       [aceSnapshotStorageKey(extensionSessionId)]: {
         documentId,
         revisionId: baseline.revisionId || "",
         wordCount,
-        wordCounts,
-        createdAt: new Date().toISOString()
+        wordCounts: wordCounts || null,
+        createdAt: new Date().toISOString(),
+        source: hasWordMap ? "local-baseline" : "visible-total-baseline"
       }
     });
 
     return {
       ok: true,
       status: 200,
-      method: "local-baseline",
+      method: hasWordMap ? "local-baseline" : "visible-total-baseline",
       revisionId: baseline.revisionId || "",
       wordCount,
-      wordCounts
+      wordCounts: wordCounts || null,
+      wordCountDiagnostic: hasWordMap
+        ? ""
+        : `W-START-SAVED-TOTAL-BASELINE: started from saved total ${wordCount}; exact added/removed split requires a current Google API word map.`
     };
   }
 
@@ -1320,6 +1344,19 @@
         clearSnapshot: false
       });
       if (!response.ok || !Number.isFinite(response.wordCount)) {
+        const visibleWordCount = Number(response.visibleWordCount);
+        if (
+          Number.isFinite(visibleWordCount)
+          && visibleWordCount > 0
+          && Number.isFinite(startWordCount)
+        ) {
+          bestVisibleFallbackResponse = aceVisibleWordCountFallbackResponse(response, {
+            attempt: attempt + 1,
+            startWordCount,
+            startRevisionId,
+            revisionChanged: false
+          });
+        }
         bestResponse = response;
       } else {
         const visibleWordCount = Number(response.visibleWordCount);
