@@ -68,6 +68,67 @@ test("canonical case #2 computes +100 / -100 / net 0", async () => {
   assert.equal(diff.netWordsChanged, 0);
 });
 
+test("draft-only words deleted before session end do not count as removals", async () => {
+  const finalTokens = Array.from({ length: 600 }, (_, index) => `survivor${index}`);
+  const { exports } = loadBackground([
+    makeGoogleDoc("", "start-empty"),
+    makeGoogleDoc(finalTokens.join(" "), "end-600")
+  ]);
+
+  await exports.aceStoreGoogleDocStartSnapshot({
+    documentId: "doc-test",
+    extensionSessionId: "session-test",
+    interactive: false
+  });
+  const diff = await exports.aceFetchGoogleDocWordDiff({
+    documentId: "doc-test",
+    extensionSessionId: "session-test",
+    interactive: false,
+    clearSnapshot: false
+  });
+
+  assert.equal(diff.wordDiffMethod, "google-api-token-sequence");
+  assert.equal(diff.startWordCount, 0);
+  assert.equal(diff.wordCount, 600);
+  assert.equal(diff.wordsAdded, 600);
+  assert.equal(diff.wordsRemoved, 0);
+  assert.equal(diff.wordsAdded + diff.wordsRemoved, 600);
+  assert.equal(diff.netWordsChanged, 600);
+});
+
+test("baseline deletions count, deleted draft words do not", async () => {
+  const stablePrefix = Array.from({ length: 450 }, (_, index) => `keep${index}`);
+  const stableSuffix = Array.from({ length: 450 }, (_, index) => `tail${index}`);
+  const removedBaseline = Array.from({ length: 100 }, (_, index) => `baseline${index}`);
+  const survivingDraft = Array.from({ length: 150 }, (_, index) => `draft${index}`);
+  const startText = [...stablePrefix, ...removedBaseline, ...stableSuffix].join(" ");
+  const endText = [...stablePrefix, ...survivingDraft, ...stableSuffix].join(" ");
+  const { exports } = loadBackground([
+    makeGoogleDoc(startText, "start-1000"),
+    makeGoogleDoc(endText, "end-1050")
+  ]);
+
+  await exports.aceStoreGoogleDocStartSnapshot({
+    documentId: "doc-test",
+    extensionSessionId: "session-test",
+    interactive: false
+  });
+  const diff = await exports.aceFetchGoogleDocWordDiff({
+    documentId: "doc-test",
+    extensionSessionId: "session-test",
+    interactive: false,
+    clearSnapshot: false
+  });
+
+  assert.equal(diff.wordDiffMethod, "google-api-token-sequence");
+  assert.equal(diff.startWordCount, 1000);
+  assert.equal(diff.wordCount, 1050);
+  assert.equal(diff.wordsAdded, 150);
+  assert.equal(diff.wordsRemoved, 100);
+  assert.equal(diff.wordsAdded + diff.wordsRemoved, 250);
+  assert.equal(diff.netWordsChanged, 50);
+});
+
 test("case-only changes normalize away", () => {
   const { exports } = loadBackground();
   const diff = exports.aceCompareWordTokens(
