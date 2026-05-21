@@ -16,7 +16,7 @@
   const ACE_GOOGLE_DOC_DIFF_MESSAGE = "ace-google-doc-diff";
   const ACE_WORD_SNAPSHOT_STORAGE_PREFIX = "aceWordSnapshot:";
   const ACE_AUTO_START_UNBOUND_RECHECK_MS = 30000;
-  const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v2";
+  const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v3";
   const ACE_IS_TOP_FRAME = window.top === window;
   const ACE_ISSUE_TITLE_WORD_LIMIT = 8;
 

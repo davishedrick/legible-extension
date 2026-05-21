@@ -149,8 +149,7 @@ test("punctuation and symbols split into Google Docs-like tokens", () => {
       "test",
       "app",
       "py",
-      "author",
-      "companion",
+      "author-companion",
       "davishedrick",
       "pythonanywhere",
       "com",
@@ -158,6 +157,56 @@ test("punctuation and symbols split into Google Docs-like tokens", () => {
       "py"
     ]
   );
+});
+
+test("Unicode mismatch fixture matches Google Docs visible word count", () => {
+  const { exports } = loadBackground();
+  const text = fs.readFileSync(path.resolve(__dirname, "fixtures", "mismatch_192_visible_220_api_unicode.txt"), "utf8");
+  const tokens = localArray(exports.aceWordTokensInText(text));
+
+  assert.equal(tokens.length, 192);
+  assert.equal(tokens[5], "consectetur");
+  assert(tokens.includes("countcount"));
+  assert(tokens.includes("wordword"));
+  assert(tokens.includes("gammadelta"));
+  assert(tokens.includes("endofstresstestdocument"));
+  assert(!tokens.includes("123456"));
+  assert(!tokens.includes("789"));
+});
+
+test("zero-width format controls do not split visible words", () => {
+  const { exports } = loadBackground();
+
+  assert.deepEqual(localArray(exports.aceWordTokensInText("word\u200bword")), ["wordword"]);
+  assert.deepEqual(localArray(exports.aceWordTokensInText("word\u200cword")), ["wordword"]);
+  assert.deepEqual(localArray(exports.aceWordTokensInText("word\u200dword")), ["wordword"]);
+  assert.deepEqual(localArray(exports.aceWordTokensInText("word\u2060word")), ["wordword"]);
+  assert.deepEqual(localArray(exports.aceWordTokensInText("word\ufeffword")), ["wordword"]);
+});
+
+test("non-breaking and Unicode spaces behave as word separators", () => {
+  const { exports } = loadBackground();
+
+  assert.deepEqual(localArray(exports.aceWordTokensInText("word\u00a0word")), ["word", "word"]);
+  assert.deepEqual(
+    localArray(exports.aceWordTokensInText("figure\u2007thin\u2009narrow\u202fideographic\u3000space")),
+    ["figure", "thin", "narrow", "ideographic", "space"]
+  );
+});
+
+test("soft hyphen and combining marks remain inside visible words", () => {
+  const { exports } = loadBackground();
+
+  assert.deepEqual(localArray(exports.aceWordTokensInText("soft\u00adhyphen")), ["softhyphen"]);
+  assert.deepEqual(localArray(exports.aceWordTokensInText("café cafe\u0301")), ["café", "café"]);
+  assert.deepEqual(localArray(exports.aceWordTokensInText("a\u0338rcu e\u0337get Bullet\u0300")), ["a̸rcu", "e̷get", "bullet̀"]);
+});
+
+test("pure digit runs are not counted as Google Docs words", () => {
+  const { exports } = loadBackground();
+
+  assert.deepEqual(localArray(exports.aceWordTokensInText("123456 789\u200c012 345\u200d678")), []);
+  assert.deepEqual(localArray(exports.aceWordTokensInText("keep0 draft42")), ["keep0", "draft42"]);
 });
 
 test("Google Docs API request previews without suggestions", async () => {

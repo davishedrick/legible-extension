@@ -1,0 +1,12 @@
+Lorem ipsum‌ dolor‍ sit﻿ amet, con­sectetur adipiscing elit. Àliquam a̸rcu e̷get ñibh facilisis, sed cômmodo mi tincidunt. The quick brown fox ju‌mps o‍ver the lazy d﻿og while αlpha, Аlpha, and Alpha appear visually similar but use Greek, Cyrillic, and Latin characters. One⁠ two three  four  five  six　seven eight nine ten.
+Bullet one contains zero-width spaces between nearly every word.
+Bullet‌ two uses non-breaking spaces that may or may not be treated as separators.
+Bullet‍ three includes joiners and invisible formatting marks.
+Bullet﻿ four mixes homoglyphs: раураl versus paypal, mіcrosoft versus microsoft.
+Bullet­ five inserts soft hyphens that are invisible until line breaks.
+Bullet̀ six stacks combining marks: a̐ ē ï ő u̇.
+Bullet  seven uses figure spaces, thin spaces, narrow no-break spaces, and ideographic spaces.
+Bullet⁠ eight repeats tokens with hidden separators: testtest, count‌count, word‍word.
+Café café résumé résumé naïve naïve coöperate coöperate. Each pair appears almost identical, but one version uses precomposed Unicode and the other uses combining characters. Some parsers normalize these to the same token; others count them differently.
+AlphaBeta Gamma‌Delta Epsilon‍Zeta Eta﻿Theta Iota­Kappa Lambda⁠Mu Nu Xi Omicron Pi Rho Sigma Tau Upsilon Phi　Chi Psi Omega.
+123456 789‌012 345‍678 901﻿234 567­890. Endof‌stress‍test﻿document.

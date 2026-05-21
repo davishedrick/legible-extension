@@ -8,7 +8,7 @@
   const ACE_GOOGLE_DOC_DIFF_MESSAGE = "ace-google-doc-diff";
   const ACE_GOOGLE_DOCS_SCOPE = "https://www.googleapis.com/auth/documents.readonly";
   const ACE_WORD_SNAPSHOT_STORAGE_PREFIX = "aceWordSnapshot:";
-  const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v2";
+  const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v3";
   const ACE_GOOGLE_DOCS_SUGGESTIONS_VIEW_MODE = "PREVIEW_WITHOUT_SUGGESTIONS";
   const ACE_SCRIPTOR_SESSION_COOKIE = "session";
   const ACE_SCRIPTOR_SESSION_HEADER = "X-Scriptor-Session";
@@ -385,9 +385,14 @@
       suggestionsViewMode: ACE_GOOGLE_DOCS_SUGGESTIONS_VIEW_MODE,
       extractedText: extraction.text,
       tokenCount: wordTokens.length,
+      fullTokens: wordTokens,
+      first150Tokens: wordTokens.slice(0, 150),
       final100Tokens: wordTokens.slice(-100),
+      last150Tokens: wordTokens.slice(-150),
+      suspiciousUnicodeRanges: aceSuspiciousUnicodeRanges(extraction.text),
       sourceTokenCounts: aceSourceTokenCounts(extraction.sources),
-      sourceTextSamples: aceSourceTextSamples(extraction.sources)
+      sourceTextSamples: aceSourceTextSamples(extraction.sources),
+      duplicateTextHashes: aceDuplicateTextHashes(extraction.sources)
     });
     return {
       status: response.status,
@@ -604,6 +609,97 @@
     }));
   }
 
+  function aceDuplicateTextHashes(sources) {
+    const seen = new Map();
+    Object.entries(sources || {}).forEach(function ([source, chunks]) {
+      (chunks || []).forEach(function (chunk, index) {
+        const text = String(chunk || "").trim();
+        if (!text) {
+          return;
+        }
+        const hash = aceSimpleHash(text);
+        const item = seen.get(hash) || {
+          hash,
+          tokenCount: aceWordTokensInText(text).length,
+          occurrences: []
+        };
+        item.occurrences.push({ source, index, sample: text.slice(0, 120) });
+        seen.set(hash, item);
+      });
+    });
+    return Array.from(seen.values()).filter(function (item) {
+      return item.occurrences.length > 1;
+    });
+  }
+
+  function aceSimpleHash(text) {
+    let hash = 2166136261;
+    for (let index = 0; index < text.length; index += 1) {
+      hash ^= text.charCodeAt(index);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16);
+  }
+
+  function aceSuspiciousUnicodeRanges(text) {
+    const value = String(text || "");
+    const ranges = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const codePoint = value.codePointAt(index);
+      const character = String.fromCodePoint(codePoint);
+      const name = aceSuspiciousUnicodeName(codePoint, character);
+      if (codePoint > 0xffff) {
+        index += 1;
+      }
+      if (!name) {
+        continue;
+      }
+      const start = Math.max(0, index - 24);
+      const end = Math.min(value.length, index + 25);
+      const context = value.slice(start, end);
+      ranges.push({
+        index,
+        codePoint: `U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}`,
+        name,
+        context,
+        contextCodePoints: Array.from(context).map(function (item) {
+          const itemCodePoint = item.codePointAt(0);
+          return `U+${itemCodePoint.toString(16).toUpperCase().padStart(4, "0")}`;
+        })
+      });
+    }
+    return ranges;
+  }
+
+  function aceSuspiciousUnicodeName(codePoint, character) {
+    const names = {
+      0x00ad: "SOFT HYPHEN",
+      0x00a0: "NO-BREAK SPACE",
+      0x2007: "FIGURE SPACE",
+      0x2009: "THIN SPACE",
+      0x202f: "NARROW NO-BREAK SPACE",
+      0x3000: "IDEOGRAPHIC SPACE",
+      0x200b: "ZERO WIDTH SPACE",
+      0x200c: "ZERO WIDTH NON-JOINER",
+      0x200d: "ZERO WIDTH JOINER",
+      0x2060: "WORD JOINER",
+      0xfeff: "ZERO WIDTH NO-BREAK SPACE"
+    };
+    if (names[codePoint]) {
+      return names[codePoint];
+    }
+    if (/\p{M}/u.test(character)) {
+      return "COMBINING MARK";
+    }
+    if (/\p{Script=Greek}/u.test(character)) {
+      return "GREEK CHARACTER";
+    }
+    if (/\p{Script=Cyrillic}/u.test(character)) {
+      return "CYRILLIC CHARACTER";
+    }
+    return "";
+  }
+
   function aceCountWordsInText(text) {
     return aceWordTokensInText(text).length;
   }
@@ -615,14 +711,15 @@
   function aceWordTokensInText(text) {
     const textForCounting = String(text || "")
       .normalize("NFKC")
+      .replace(/[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0]/g, "")
       .replace(/\u00a0/g, " ");
-    const matches = textForCounting.match(/[\p{L}\p{N}]+(?:['’][\p{L}\p{N}]+)*/gu) || [];
+    const matches = textForCounting.match(/[\p{L}\p{N}][\p{L}\p{N}\p{M}]*(?:(?:['’]|[-‐‑‒–—])(?=[\p{L}\p{N}])[\p{L}\p{N}\p{M}]*)*/gu) || [];
     return matches
       .map(function (token) {
         return token.toLocaleLowerCase();
       })
       .filter(function (token) {
-        return Boolean(token) && /[\p{L}\p{N}]/u.test(token);
+        return Boolean(token) && /\p{L}/u.test(token);
       });
   }
 
