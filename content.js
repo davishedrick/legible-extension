@@ -1038,8 +1038,23 @@
       return [];
     }
 
-    return Array.from(targetDocument.querySelectorAll("div, span, button, [aria-label], [role='button']"))
+    const viewportWidth = targetWindow.innerWidth || targetDocument.documentElement?.clientWidth || 0;
+    const viewportHeight = targetWindow.innerHeight || targetDocument.documentElement?.clientHeight || 0;
+    const elements = new Map();
+    Array.from(targetDocument.querySelectorAll("div, span, button, [aria-label], [role='button']"))
+      .forEach(function (element) {
+        elements.set(element, false);
+      });
+
+    aceBottomLeftViewportElements(targetDocument, viewportWidth, viewportHeight)
+      .forEach(function (element) {
+        elements.set(element, true);
+      });
+
+    return Array.from(elements.entries())
       .map(function (element) {
+        const fromViewportProbe = Boolean(element[1]);
+        element = element[0];
         if (element.closest?.("#ace-widget")) {
           return null;
         }
@@ -1050,8 +1065,6 @@
         }
 
         const rect = element.getBoundingClientRect();
-        const viewportWidth = targetWindow.innerWidth || targetDocument.documentElement?.clientWidth || 0;
-        const viewportHeight = targetWindow.innerHeight || targetDocument.documentElement?.clientHeight || 0;
         const isVisible = rect.width > 0
           && rect.height > 0
           && rect.bottom >= 0
@@ -1073,7 +1086,8 @@
           count,
           bottom: rect.bottom,
           left: rect.left,
-          score: (viewportHeight ? rect.bottom / viewportHeight : 0)
+          score: (fromViewportProbe ? 2 : 0)
+            + (viewportHeight ? rect.bottom / viewportHeight : 0)
             + (viewportWidth ? (1 - rect.left / viewportWidth) : 0)
         };
       })
@@ -1082,9 +1096,38 @@
       });
   }
 
+  function aceBottomLeftViewportElements(targetDocument, viewportWidth, viewportHeight) {
+    if (!targetDocument.elementsFromPoint || !viewportWidth || !viewportHeight) {
+      return [];
+    }
+
+    const elements = new Set();
+    const xPositions = [24, 80, 160, Math.min(280, viewportWidth * 0.36)];
+    const yPositions = [
+      Math.max(0, viewportHeight - 96),
+      Math.max(0, viewportHeight - 56),
+      Math.max(0, viewportHeight - 24)
+    ];
+    xPositions.forEach(function (x) {
+      yPositions.forEach(function (y) {
+        targetDocument.elementsFromPoint(x, y).forEach(function (element) {
+          let current = element;
+          let depth = 0;
+          while (current && depth < 5) {
+            elements.add(current);
+            current = current.parentElement;
+            depth += 1;
+          }
+        });
+      });
+    });
+    return Array.from(elements);
+  }
+
   function aceVisibleWordCountFromElement(element) {
     const texts = [
       element.textContent || "",
+      element.innerText || "",
       element.getAttribute?.("aria-label") || "",
       element.getAttribute?.("title") || ""
     ];
@@ -4575,7 +4618,9 @@
       aceWordChangeBreakdownForSync,
       aceMeasurementPathForSession,
       aceSessionWordsCopy,
-      aceSessionTypeRequiresExactWordDiff
+      aceSessionTypeRequiresExactWordDiff,
+      aceVisibleWordCountCandidatesInDocument,
+      aceVisibleWordCountFromElement
     });
   }
 

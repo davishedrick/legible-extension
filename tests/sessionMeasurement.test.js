@@ -65,6 +65,42 @@ test("extension UI copy displays exact editing breakdown", () => {
   assert.equal(copy, " · (+3 words - 2)");
 });
 
+test("visible word count reader probes the bottom-left Google Docs counter", () => {
+  const { exports } = loadContent();
+  const makeElement = ({ textContent = "", innerText = "", rect, parentElement = null }) => ({
+    textContent,
+    innerText,
+    parentElement,
+    closest() { return null; },
+    getAttribute() { return ""; },
+    getBoundingClientRect() { return rect; }
+  });
+  const falseZero = makeElement({
+    textContent: "0 words",
+    rect: { left: 24, top: 1030, right: 180, bottom: 1080, width: 156, height: 50 }
+  });
+  const visibleCounter = makeElement({
+    innerText: "1,918 words",
+    rect: { left: 20, top: 980, right: 280, bottom: 1054, width: 260, height: 74 }
+  });
+  const targetDocument = {
+    documentElement: { clientWidth: 2048, clientHeight: 1152 },
+    querySelectorAll() {
+      return [falseZero];
+    },
+    elementsFromPoint() {
+      return [visibleCounter];
+    }
+  };
+  const candidates = exports.aceVisibleWordCountCandidatesInDocument(
+    targetDocument,
+    { innerWidth: 2048, innerHeight: 1152 }
+  );
+  const best = candidates.sort((a, b) => b.score - a.score)[0];
+
+  assert.equal(best.count, 1918);
+});
+
 test("backend persistence preserves exact extension breakdown", () => {
   const appPath = path.resolve(__dirname, "..", "..", "Author-companion", "writing_app");
   const script = `
