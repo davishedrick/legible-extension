@@ -10,6 +10,8 @@
   const ACE_WORD_SNAPSHOT_STORAGE_PREFIX = "aceWordSnapshot:";
   const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v2";
   const ACE_GOOGLE_DOCS_SUGGESTIONS_VIEW_MODE = "PREVIEW_WITHOUT_SUGGESTIONS";
+  const ACE_SCRIPTOR_SESSION_COOKIE = "session";
+  const ACE_SCRIPTOR_SESSION_HEADER = "X-Scriptor-Session";
 
   chrome.runtime.onMessage.addListener(function (message, _sender, sendResponse) {
     if (!message) {
@@ -94,13 +96,18 @@
     }
 
     const options = message.options || {};
+    const headers = {
+      "Content-Type": "application/json",
+      ...(options.headers || {})
+    };
+    const sessionCookie = await aceGetScriptorSessionCookie();
+    if (sessionCookie && !headers[ACE_SCRIPTOR_SESSION_HEADER]) {
+      headers[ACE_SCRIPTOR_SESSION_HEADER] = sessionCookie;
+    }
     const response = await fetch(`${ACE_API_BASE_URL}${path}`, {
       method: options.method || "GET",
       credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-        ...(options.headers || {})
-      },
+      headers,
       body: options.body || undefined
     });
 
@@ -121,6 +128,24 @@
       payload,
       error: payload.error || response.statusText || "Scriptor API request failed."
     };
+  }
+
+  function aceGetScriptorSessionCookie() {
+    return new Promise(function (resolve) {
+      if (!chrome.cookies?.get) {
+        resolve("");
+        return;
+      }
+      chrome.cookies.get(
+        {
+          url: ACE_API_BASE_URL,
+          name: ACE_SCRIPTOR_SESSION_COOKIE
+        },
+        function (cookie) {
+          resolve(cookie?.value || "");
+        }
+      );
+    });
   }
 
   async function aceFetchGoogleDocWordCount(message) {
@@ -705,6 +730,7 @@
   if (globalThis.__ACE_TEST_EXPORTS__) {
     Object.assign(globalThis.__ACE_TEST_EXPORTS__, {
       aceStoreGoogleDocStartSnapshot,
+      aceFetchFromApp,
       aceFetchGoogleDocWordDiff,
       aceFetchGoogleDocSnapshot,
       aceExtractGoogleDocText,

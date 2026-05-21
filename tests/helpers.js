@@ -23,19 +23,29 @@ function makeGoogleDoc(text, revisionId = "revision") {
   };
 }
 
-function loadBackground(fixtures = []) {
+function loadBackground(fixtures = [], options = {}) {
   const storage = {};
   const responses = [...fixtures];
   const exports = {};
   const fetchUrls = [];
+  const fetchCalls = [];
   const source = fs.readFileSync(path.resolve(__dirname, "..", "background.js"), "utf8");
   const context = {
     console,
     __ACE_TEST_EXPORTS__: exports,
     URLSearchParams,
-    fetch: async (url) => {
+    fetch: async (url, fetchOptions = {}) => {
       fetchUrls.push(String(url));
+      fetchCalls.push({ url: String(url), options: fetchOptions });
       if (!responses.length) {
+        if (options.defaultFetchPayload) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => options.defaultFetchPayload,
+            text: async () => JSON.stringify(options.defaultFetchPayload)
+          };
+        }
         throw new Error("No mocked Google Docs response queued.");
       }
       const payload = responses.shift();
@@ -60,6 +70,11 @@ function loadBackground(fixtures = []) {
         },
         removeCachedAuthToken(_options, callback) {
           callback();
+        }
+      },
+      cookies: {
+        get(_details, callback) {
+          callback(options.sessionCookie ? { value: options.sessionCookie } : null);
         }
       },
       storage: {
@@ -89,7 +104,7 @@ function loadBackground(fixtures = []) {
   };
   vm.createContext(context);
   vm.runInContext(source, context);
-  return { exports, storage, fetchUrls };
+  return { exports, storage, fetchUrls, fetchCalls };
 }
 
 function loadContent() {

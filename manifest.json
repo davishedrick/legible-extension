@@ -3,7 +3,7 @@
   "name": "Scriptor",
   "version": "0.1.3",
   "description": "A lightweight Google Docs companion that starts Scriptor sessions when writing begins.",
-  "permissions": ["storage", "identity"],
+  "permissions": ["storage", "identity", "cookies"],
   "host_permissions": [
     "https://davishedrick.pythonanywhere.com/*",
     "https://docs.googleapis.com/*",

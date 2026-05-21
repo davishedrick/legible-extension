@@ -170,6 +170,22 @@ test("Google Docs API request previews without suggestions", async () => {
   assert.equal(requestUrl.searchParams.get("suggestionsViewMode"), "PREVIEW_WITHOUT_SUGGESTIONS");
 });
 
+test("Scriptor API requests include session header when website cookie exists", async () => {
+  const { exports, fetchCalls } = loadBackground([], {
+    defaultFetchPayload: { projects: [] },
+    sessionCookie: "signed-session-cookie"
+  });
+
+  const response = await exports.aceFetchFromApp({
+    path: "/api/projects",
+    options: { method: "GET" }
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(fetchCalls[0].options.credentials, "include");
+  assert.equal(fetchCalls[0].options.headers["X-Scriptor-Session"], "signed-session-cookie");
+});
+
 test("tabs response does not double-count duplicate top-level body content", async () => {
   const payload = {
     revisionId: "tabs-revision",
