@@ -1,0 +1,18 @@
+{
+  "revisionId": "start-revision",
+  "body": {
+    "content": [
+      {
+        "paragraph": {
+          "elements": [
+            {
+              "textRun": {
+                "content": "apple banana dog friend\n"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

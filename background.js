@@ -143,10 +143,12 @@
     }
 
     const snapshot = await aceFetchGoogleDocSnapshot(documentId, Boolean(message.interactive));
-    console.info("[ACE] Google Docs word count", {
+    console.info("[ACE] SESSION END", {
+      measurementPath: "exact-api-sequence-diff",
       documentId,
       revisionId: snapshot.revisionId || "",
-      wordCount: snapshot.wordCount
+      apiWordCount: snapshot.wordCount,
+      tokenCount: snapshot.wordTokens.length
     });
 
     return {
@@ -195,11 +197,13 @@
       }
     });
 
-    console.info("[ACE] Google Docs start snapshot", {
+    console.info("[ACE] SESSION START", {
+      measurementPath: "exact-api-sequence-diff",
       documentId,
       extensionSessionId,
       revisionId: snapshot.revisionId || "",
-      wordCount: snapshot.wordCount,
+      apiWordCount: snapshot.wordCount,
+      tokenCount: snapshot.wordTokens.length,
       wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion
     });
 
@@ -282,13 +286,16 @@
       await aceStorageRemove(aceSnapshotStorageKey(extensionSessionId));
     }
 
-    console.info("[ACE] Google Docs word diff", {
+    console.info("[ACE] DIFF RESULT", {
+      measurementPath: diff.method || "exact-api-sequence-diff",
       documentId,
       extensionSessionId,
       startRevisionId: startSnapshot.revisionId || "",
       endRevisionId: endSnapshot.revisionId || "",
       wordsAdded: diff.wordsAdded,
-      wordsRemoved: diff.wordsRemoved
+      wordsRemoved: diff.wordsRemoved,
+      wordsEdited: diff.wordsAdded + diff.wordsRemoved,
+      netWordsChanged: endSnapshot.wordCount - startSnapshot.wordCount
     });
 
     return {
@@ -585,5 +592,18 @@
       previous = current;
     }
     return previous[after.length];
+  }
+
+  if (globalThis.__ACE_TEST_EXPORTS__) {
+    Object.assign(globalThis.__ACE_TEST_EXPORTS__, {
+      aceStoreGoogleDocStartSnapshot,
+      aceFetchGoogleDocWordDiff,
+      aceFetchGoogleDocSnapshot,
+      aceExtractGoogleDocText,
+      aceWordTokensInText,
+      aceWordCountsInText,
+      aceCompareWordTokens,
+      aceCompareWordCounts
+    });
   }
 })();

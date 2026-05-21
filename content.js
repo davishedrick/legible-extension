@@ -670,7 +670,14 @@
 
   async function acePostSession(session) {
     const payload = aceSessionSyncPayload(session);
-    console.info("[ACE] Syncing extension session payload", payload);
+    console.info("[ACE] PRE-SYNC", {
+      measurementPath: aceMeasurementPathForSession(payload),
+      wordsAdded: payload.wordsAdded,
+      wordsRemoved: payload.wordsRemoved,
+      wordsEdited: payload.wordsEdited,
+      netWordsChanged: payload.netWordsChanged,
+      payload
+    });
     return aceApiFetch("/api/extension/sessions", {
       method: "POST",
       body: JSON.stringify(payload)
@@ -767,6 +774,27 @@
       wordsRemoved: 0,
       wordsEdited
     };
+  }
+
+  function aceMeasurementPathForSession(session) {
+    if (session?.measurementPending) {
+      return "measurement-unavailable";
+    }
+    if (session?.wordDiffMethod === "google-api-token-map-fallback") {
+      return "api-word-map-diff";
+    }
+    if (session?.wordDiffMethod === "google-api-token-sequence") {
+      return "exact-api-sequence-diff";
+    }
+    if (session?.wordCountMethod === "visible-total-fallback") {
+      return "visible-total-fallback";
+    }
+    if (session?.wordCountMethod === "visible-total-baseline") {
+      return "saved-total-baseline";
+    }
+    return session?.wordCountMethod === "google-docs-api"
+      ? "exact-api-sequence-diff"
+      : "measurement-unavailable";
   }
 
   async function aceGoogleDocMessage(aceType, payload) {
@@ -2296,6 +2324,14 @@
     const contextInvalid = aceSyncMessage.toLowerCase().includes("extension context");
     const retryDisabled = contextInvalid ? "disabled" : "";
     const changeProjectDisabled = contextInvalid ? "disabled" : "";
+    console.info("[ACE] UI RENDER", {
+      measurementPath: aceMeasurementPathForSession(aceCompletedSession),
+      wordsAdded: aceCompletedSession?.wordsAdded,
+      wordsRemoved: aceCompletedSession?.wordsRemoved,
+      wordsEdited: aceCompletedSession?.wordsEdited,
+      netWordsChanged: aceCompletedSession?.netWordsChanged,
+      display: wordsCopy
+    });
 
     aceWidget.className = "ace-widget ace-widget--completed";
     aceWidget.innerHTML = `
@@ -3064,6 +3100,14 @@
     aceClearActivityTimers();
     await acePersistActiveSession();
     await aceRememberLastSessionType(sessionType);
+    console.info("[ACE] SESSION START", {
+      sessionType,
+      visibleWordCount: startSnapshot.visibleWordCount ?? null,
+      apiWordCount: startSnapshot.apiWordCount ?? startSnapshot.wordCount ?? null,
+      revisionId: startSnapshot.revisionId || "",
+      tokenCount: Array.isArray(startSnapshot.wordTokens) ? startSnapshot.wordTokens.length : null,
+      measurementPath: aceMeasurementPathForSession(aceActiveSession)
+    });
     aceStartTimer();
     if (!projectId) {
       aceRunAsync(aceResolveBindingForActiveSession(), "resolve active session binding");
@@ -3385,6 +3429,21 @@
       endRevisionId: wordDiff.revisionId || "",
       source: wordDiff.wordDiffMethod || (wordDiff.endWordTokens ? "google-api-token-sequence" : "api-total-fallback")
     });
+    console.info("[ACE] SESSION END", {
+      sessionType: activeSession.sessionType,
+      visibleWordCount: wordDiff.visibleWordCount ?? null,
+      apiWordCount: wordDiff.apiWordCount ?? wordDiff.wordCount ?? null,
+      revisionId: wordDiff.revisionId || "",
+      tokenCount: Array.isArray(wordDiff.endWordTokens) ? wordDiff.endWordTokens.length : null,
+      measurementPath: wordDiff.wordDiffMethod || (measurementPending ? "measurement-unavailable" : "exact-api-sequence-diff")
+    });
+    console.info("[ACE] DIFF RESULT", {
+      measurementPath: wordDiff.wordDiffMethod || (measurementPending ? "measurement-unavailable" : "exact-api-sequence-diff"),
+      wordsAdded,
+      wordsRemoved,
+      wordsEdited: measuredWordsEdited,
+      netWordsChanged
+    });
     aceCompletedSession = {
       documentId: activeSession.documentId || aceExtractDocumentId(),
       projectId: activeSession.projectId || "",
@@ -3412,6 +3471,7 @@
       endDocumentWordTokens: wordDiff.endWordTokens || null,
       endDocumentRevisionId: wordDiff.revisionId || "",
       wordCountTokenizerVersion: wordDiff.wordCountTokenizerVersion || "",
+      wordDiffMethod: wordDiff.wordDiffMethod || "",
       wordCountMethod: "google-docs-api",
       wordCountError,
       wordCountDiagnostic,
@@ -3986,6 +4046,14 @@
       aceSelectedProject = result.project || aceSelectedProject;
       aceSyncStatus = "synced";
       aceSyncMessage = result.duplicate ? "Already synced." : "Synced.";
+      console.info("[ACE] POST-SYNC RESPONSE", {
+        measurementPath: aceMeasurementPathForSession(result.session || sessionToSync),
+        wordsAdded: result.session?.wordsAdded,
+        wordsRemoved: result.session?.wordsRemoved,
+        wordsEdited: result.session?.wordsEdited,
+        netWordsChanged: result.session?.netWordsChanged,
+        duplicate: Boolean(result.duplicate)
+      });
       await aceSaveDocumentBaseline(sessionToSync, aceSelectedProject);
       if (!aceIsCompletedSessionCurrent(completedSessionId)) {
         return;
@@ -4120,6 +4188,7 @@
       endDocumentWordTokens: wordDiff.endWordTokens || null,
       endDocumentRevisionId: wordDiff.revisionId || "",
       wordCountTokenizerVersion: wordDiff.wordCountTokenizerVersion || "",
+      wordDiffMethod: wordDiff.wordDiffMethod || "",
       wordCountMethod: "google-docs-api",
       wordCountError: "",
       wordCountDiagnostic: wordDiff.wordCountDiagnostic || aceGoogleDocDiffDiagnostic({
@@ -4498,6 +4567,16 @@
     if (status && status.textContent === "Selected text added as the quote.") {
       status.remove();
     }
+  }
+
+  if (globalThis.__ACE_TEST_EXPORTS__) {
+    Object.assign(globalThis.__ACE_TEST_EXPORTS__, {
+      aceSessionSyncPayload,
+      aceWordChangeBreakdownForSync,
+      aceMeasurementPathForSession,
+      aceSessionWordsCopy,
+      aceSessionTypeRequiresExactWordDiff
+    });
   }
 
   document.addEventListener("beforeinput", aceHandleInputLikeActivity, true);
