@@ -159,3 +159,76 @@ test("punctuation and symbols split into Google Docs-like tokens", () => {
     ]
   );
 });
+
+test("Google Docs API request previews without suggestions", async () => {
+  const { exports, fetchUrls } = loadBackground([startFixture]);
+
+  await exports.aceFetchGoogleDocSnapshot("doc-test", false);
+
+  const requestUrl = new URL(fetchUrls[0]);
+  assert.equal(requestUrl.searchParams.get("includeTabsContent"), "true");
+  assert.equal(requestUrl.searchParams.get("suggestionsViewMode"), "PREVIEW_WITHOUT_SUGGESTIONS");
+});
+
+test("tabs response does not double-count duplicate top-level body content", async () => {
+  const payload = {
+    revisionId: "tabs-revision",
+    body: {
+      content: [
+        {
+          paragraph: {
+            elements: [{ textRun: { content: "duplicate duplicate duplicate\n" } }]
+          }
+        }
+      ]
+    },
+    tabs: [
+      {
+        documentTab: {
+          body: {
+            content: [
+              {
+                paragraph: {
+                  elements: [{ textRun: { content: "apple banana dog friend\n" } }]
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  };
+  const { exports } = loadBackground();
+  const extraction = exports.aceExtractGoogleDocTextBySource(payload);
+  const tokens = localArray(exports.aceWordTokensInText(extraction.text));
+
+  assert.deepEqual(tokens, ["apple", "banana", "dog", "friend"]);
+  assert.equal(exports.aceSourceTokenCounts(extraction.sources).body, 0);
+  assert.equal(exports.aceSourceTokenCounts(extraction.sources).tabs, 4);
+});
+
+test("suggested insertion text is reported separately and excluded from visible extraction", () => {
+  const payload = {
+    revisionId: "suggestions-revision",
+    body: {
+      content: [
+        {
+          paragraph: {
+            elements: [
+              { textRun: { content: "visible words\n" } },
+              { textRun: { content: "hidden suggestion\n", suggestedInsertionIds: ["suggestion-1"] } }
+            ]
+          }
+        }
+      ]
+    }
+  };
+  const { exports } = loadBackground();
+  const extraction = exports.aceExtractGoogleDocTextBySource(payload);
+  const tokens = localArray(exports.aceWordTokensInText(extraction.text));
+  const sourceCounts = exports.aceSourceTokenCounts(extraction.sources);
+
+  assert.deepEqual(tokens, ["visible", "words"]);
+  assert.equal(sourceCounts.body, 2);
+  assert.equal(sourceCounts.suggestions, 2);
+});

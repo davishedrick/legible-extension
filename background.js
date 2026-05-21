@@ -9,6 +9,7 @@
   const ACE_GOOGLE_DOCS_SCOPE = "https://www.googleapis.com/auth/documents.readonly";
   const ACE_WORD_SNAPSHOT_STORAGE_PREFIX = "aceWordSnapshot:";
   const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v2";
+  const ACE_GOOGLE_DOCS_SUGGESTIONS_VIEW_MODE = "PREVIEW_WITHOUT_SUGGESTIONS";
 
   chrome.runtime.onMessage.addListener(function (message, _sender, sendResponse) {
     if (!message) {
@@ -318,8 +319,12 @@
 
   async function aceFetchGoogleDocSnapshot(documentId, interactive) {
     const token = await aceGetGoogleAuthToken(interactive);
+    const params = new URLSearchParams({
+      includeTabsContent: "true",
+      suggestionsViewMode: ACE_GOOGLE_DOCS_SUGGESTIONS_VIEW_MODE
+    });
     const response = await fetch(
-      `https://docs.googleapis.com/v1/documents/${encodeURIComponent(documentId)}?includeTabsContent=true`,
+      `https://docs.googleapis.com/v1/documents/${encodeURIComponent(documentId)}?${params.toString()}`,
       {
         headers: {
           Authorization: `Bearer ${token}`
@@ -346,8 +351,19 @@
     }
 
     const documentPayload = await response.json();
-    const wordTokens = aceWordTokensInText(aceExtractGoogleDocText(documentPayload));
+    const extraction = aceExtractGoogleDocTextBySource(documentPayload);
+    const wordTokens = aceWordTokensInText(extraction.text);
     const wordCounts = aceWordCountsFromTokens(wordTokens);
+    console.info("[ACE] API TEXT DIAGNOSTIC", {
+      documentId,
+      revisionId: documentPayload.revisionId || "",
+      suggestionsViewMode: ACE_GOOGLE_DOCS_SUGGESTIONS_VIEW_MODE,
+      extractedText: extraction.text,
+      tokenCount: wordTokens.length,
+      final100Tokens: wordTokens.slice(-100),
+      sourceTokenCounts: aceSourceTokenCounts(extraction.sources),
+      sourceTextSamples: aceSourceTextSamples(extraction.sources)
+    });
     return {
       status: response.status,
       revisionId: documentPayload.revisionId || "",
@@ -420,24 +436,67 @@
   }
 
   function aceExtractGoogleDocText(documentPayload) {
-    const chunks = [];
+    return aceExtractGoogleDocTextBySource(documentPayload).text;
+  }
 
-    function collectTextRun(paragraphElement) {
-      const content = paragraphElement?.textRun?.content;
+  function aceExtractGoogleDocTextBySource(documentPayload) {
+    const chunks = [];
+    const sources = {
+      body: [],
+      tabs: [],
+      headers: [],
+      footers: [],
+      footnotes: [],
+      tables: [],
+      tableOfContents: [],
+      suggestions: [],
+      namedRanges: [],
+      inlineObjects: [],
+      other: []
+    };
+
+    function pushSource(source, content) {
       if (content) {
+        sources[source].push(content);
         chunks.push(content);
       }
     }
 
-    function collectStructuralElement(element) {
+    function recordSource(source, content) {
+      if (content) {
+        sources[source].push(content);
+      }
+    }
+
+    function collectTextRun(paragraphElement, source) {
+      const textRun = paragraphElement?.textRun;
+      const content = textRun?.content;
+      if (!content) {
+        return;
+      }
+      if (Array.isArray(textRun.suggestedInsertionIds) && textRun.suggestedInsertionIds.length) {
+        recordSource("suggestions", content);
+        return;
+      }
+      pushSource(source, content);
+    }
+
+    function collectStructuralElement(element, source) {
+      if (element?.tableOfContents) {
+        recordSource("tableOfContents", aceTextFromStructuralElements(element.tableOfContents.content || []));
+        return;
+      }
+
       if (element?.paragraph?.elements) {
-        element.paragraph.elements.forEach(collectTextRun);
+        element.paragraph.elements.forEach(function (paragraphElement) {
+          collectTextRun(paragraphElement, source);
+        });
       }
 
       if (element?.table?.tableRows) {
         element.table.tableRows.forEach(function (row) {
           (row.tableCells || []).forEach(function (cell) {
-            collectStructuralElements(cell.content || []);
+            collectStructuralElements(cell.content || [], "tables");
           });
         });
       }
@@ -445,30 +504,79 @@
       // Google Docs' visible manuscript word count excludes generated table-of-contents text.
     }
 
-    function collectStructuralElements(elements) {
-      (elements || []).forEach(collectStructuralElement);
+    function collectStructuralElements(elements, source) {
+      (elements || []).forEach(function (element) {
+        collectStructuralElement(element, source);
+      });
     }
 
-    function collectDocumentTab(documentTab) {
+    function collectDocumentTab(documentTab, source) {
       if (!documentTab) {
         return;
       }
 
-      collectStructuralElements(documentTab.body?.content || []);
+      collectStructuralElements(documentTab.body?.content || [], source);
+      Object.values(documentTab.headers || {}).forEach(function (header) {
+        recordSource("headers", aceTextFromStructuralElements(header.content || []));
+      });
+      Object.values(documentTab.footers || {}).forEach(function (footer) {
+        recordSource("footers", aceTextFromStructuralElements(footer.content || []));
+      });
+      Object.values(documentTab.footnotes || {}).forEach(function (footnote) {
+        recordSource("footnotes", aceTextFromStructuralElements(footnote.content || []));
+      });
     }
 
     function collectTab(tab) {
-      collectDocumentTab(tab?.documentTab);
+      collectDocumentTab(tab?.documentTab, "tabs");
       (tab?.childTabs || []).forEach(collectTab);
     }
 
     if (Array.isArray(documentPayload.tabs) && documentPayload.tabs.length) {
       documentPayload.tabs.forEach(collectTab);
     } else {
-      collectDocumentTab(documentPayload);
+      collectDocumentTab(documentPayload, "body");
     }
 
+    return {
+      text: chunks.join(" "),
+      sources
+    };
+  }
+
+  function aceTextFromStructuralElements(elements) {
+    const chunks = [];
+    (elements || []).forEach(function collect(element) {
+      if (element?.paragraph?.elements) {
+        element.paragraph.elements.forEach(function (paragraphElement) {
+          const content = paragraphElement?.textRun?.content;
+          if (content) {
+            chunks.push(content);
+          }
+        });
+      }
+      if (element?.table?.tableRows) {
+        element.table.tableRows.forEach(function (row) {
+          (row.tableCells || []).forEach(function (cell) {
+            (cell.content || []).forEach(collect);
+          });
+        });
+      }
+    });
     return chunks.join(" ");
+  }
+
+  function aceSourceTokenCounts(sources) {
+    return Object.fromEntries(Object.entries(sources).map(function ([source, chunks]) {
+      return [source, aceWordTokensInText((chunks || []).join(" ")).length];
+    }));
+  }
+
+  function aceSourceTextSamples(sources) {
+    return Object.fromEntries(Object.entries(sources).map(function ([source, chunks]) {
+      const text = (chunks || []).join(" ").trim();
+      return [source, text ? text.slice(0, 500) : ""];
+    }));
   }
 
   function aceCountWordsInText(text) {
@@ -600,8 +708,10 @@
       aceFetchGoogleDocWordDiff,
       aceFetchGoogleDocSnapshot,
       aceExtractGoogleDocText,
+      aceExtractGoogleDocTextBySource,
       aceWordTokensInText,
       aceWordCountsInText,
+      aceSourceTokenCounts,
       aceCompareWordTokens,
       aceCompareWordCounts
     });

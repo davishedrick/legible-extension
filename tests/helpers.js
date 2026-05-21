@@ -27,11 +27,14 @@ function loadBackground(fixtures = []) {
   const storage = {};
   const responses = [...fixtures];
   const exports = {};
+  const fetchUrls = [];
   const source = fs.readFileSync(path.resolve(__dirname, "..", "background.js"), "utf8");
   const context = {
     console,
     __ACE_TEST_EXPORTS__: exports,
-    fetch: async () => {
+    URLSearchParams,
+    fetch: async (url) => {
+      fetchUrls.push(String(url));
       if (!responses.length) {
         throw new Error("No mocked Google Docs response queued.");
       }
@@ -86,7 +89,7 @@ function loadBackground(fixtures = []) {
   };
   vm.createContext(context);
   vm.runInContext(source, context);
-  return { exports, storage };
+  return { exports, storage, fetchUrls };
 }
 
 function loadContent() {
