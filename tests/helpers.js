@@ -107,7 +107,8 @@ function loadBackground(fixtures = [], options = {}) {
   return { exports, storage, fetchUrls, fetchCalls };
 }
 
-function loadContent() {
+function loadContent(options = {}) {
+  const storage = { ...(options.initialStorage || {}) };
   const exports = {};
   const source = fs.readFileSync(path.resolve(__dirname, "..", "content.js"), "utf8");
   const fakeElement = () => ({
@@ -122,11 +123,24 @@ function loadContent() {
     style: {},
     remove() {}
   });
-  const window = {
-    top: {},
-    addEventListener() {},
-    requestAnimationFrame(callback) { callback(); }
+  const location = {
+    href: "https://docs.google.com/document/d/doc-test/edit",
+    pathname: "/document/d/doc-test/edit",
+    search: "",
+    hash: ""
   };
+  const window = {
+    addEventListener() {},
+    requestAnimationFrame(callback) { callback(); },
+    setInterval,
+    clearInterval,
+    setTimeout,
+    clearTimeout,
+    innerWidth: 1024,
+    innerHeight: 768,
+    location
+  };
+  window.top = options.topFrame ? window : {};
   const context = {
     console,
     __ACE_TEST_EXPORTS__: exports,
@@ -147,19 +161,39 @@ function loadContent() {
       runtime: {
         lastError: null,
         sendMessage() {}
+      },
+      storage: {
+        local: {
+          get(keys, callback) {
+            if (Array.isArray(keys)) {
+              callback(Object.fromEntries(keys.map((key) => [key, storage[key]])));
+              return;
+            }
+            if (typeof keys === "string") {
+              callback({ [keys]: storage[keys] });
+              return;
+            }
+            callback({ ...storage });
+          },
+          set(values, callback) {
+            Object.assign(storage, values);
+            callback();
+          },
+          remove(keys, callback) {
+            (Array.isArray(keys) ? keys : [keys]).forEach((key) => delete storage[key]);
+            callback();
+          }
+        }
       }
     },
-    location: {
-      href: "https://docs.google.com/document/d/doc-test/edit",
-      pathname: "/document/d/doc-test/edit"
-    },
+    location,
     setTimeout,
     clearTimeout,
     URLSearchParams
   };
   vm.createContext(context);
   vm.runInContext(source, context);
-  return { exports };
+  return { exports, storage, context };
 }
 
 module.exports = {

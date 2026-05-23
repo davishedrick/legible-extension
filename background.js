@@ -5,7 +5,7 @@
   const ACE_API_MESSAGE = "ace-api-fetch";
   const ACE_GOOGLE_DOC_WORD_COUNT_MESSAGE = "ace-google-doc-word-count";
   const ACE_GOOGLE_DOC_START_SNAPSHOT_MESSAGE = "ace-google-doc-start-snapshot";
-  const ACE_GOOGLE_DOC_DIFF_MESSAGE = "ace-google-doc-diff";
+  const ACE_GOOGLE_DOC_NET_COUNT_MESSAGE = "ace-google-doc-net-count";
   const ACE_GOOGLE_DOCS_SCOPE = "https://www.googleapis.com/auth/documents.readonly";
   const ACE_WORD_SNAPSHOT_STORAGE_PREFIX = "aceWordSnapshot:";
   const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v3";
@@ -28,7 +28,6 @@
             error: error.message || "Scriptor API request failed."
           });
         });
-
       return true;
     }
 
@@ -44,7 +43,6 @@
             error: error.message || "Google Docs word count failed."
           });
         });
-
       return true;
     }
 
@@ -60,25 +58,22 @@
             error: error.message || "Google Docs start snapshot failed."
           });
         });
-
       return true;
     }
 
-    if (message.aceType === ACE_GOOGLE_DOC_DIFF_MESSAGE) {
-      aceFetchGoogleDocWordDiff(message)
+    if (message.aceType === ACE_GOOGLE_DOC_NET_COUNT_MESSAGE) {
+      aceFetchGoogleDocNetCount(message)
         .then(sendResponse)
         .catch(function (error) {
-          console.warn("[ACE] Google Docs word diff failed", error);
+          console.warn("[ACE] Google Docs net count failed", error);
           sendResponse({
             ok: false,
             status: 0,
             wordCount: null,
-            wordsAdded: 0,
-            wordsRemoved: 0,
-            error: error.message || "Google Docs word diff failed."
+            netWordsChanged: 0,
+            error: error.message || "Google Docs net count failed."
           });
         });
-
       return true;
     }
 
@@ -104,8 +99,9 @@
     if (sessionCookie && !headers[ACE_SCRIPTOR_SESSION_HEADER]) {
       headers[ACE_SCRIPTOR_SESSION_HEADER] = sessionCookie;
     }
+    const method = options.method || "GET";
     const response = await fetch(`${ACE_API_BASE_URL}${path}`, {
-      method: options.method || "GET",
+      method,
       credentials: "include",
       headers,
       body: options.body || undefined
@@ -113,7 +109,6 @@
 
     const text = await response.text();
     let payload = {};
-
     if (text) {
       try {
         payload = JSON.parse(text);
@@ -121,6 +116,16 @@
         payload = { raw: text };
       }
     }
+
+    console.info("[ACE] APP API BRIDGE", {
+      path,
+      method,
+      status: response.status,
+      hasSessionHeader: Boolean(headers[ACE_SCRIPTOR_SESSION_HEADER]),
+      ok: response.ok,
+      sessionType: payload?.session?.type || "",
+      netWordsChanged: payload?.session?.netWordsChanged
+    });
 
     return {
       ok: response.ok,
@@ -169,12 +174,11 @@
     }
 
     const snapshot = await aceFetchGoogleDocSnapshot(documentId, Boolean(message.interactive));
-    console.info("[ACE] SESSION END", {
-      measurementPath: "exact-api-sequence-diff",
+    console.info("[ACE] GOOGLE DOC WORD COUNT", {
+      measurementPath: "google-docs-net-count",
       documentId,
       revisionId: snapshot.revisionId || "",
-      apiWordCount: snapshot.wordCount,
-      tokenCount: snapshot.wordTokens.length
+      apiWordCount: snapshot.wordCount
     });
 
     return {
@@ -183,9 +187,7 @@
       method: "google-docs-api",
       revisionId: snapshot.revisionId || "",
       wordCount: snapshot.wordCount,
-      wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion,
-      wordCounts: snapshot.wordCounts,
-      wordTokens: snapshot.wordTokens
+      wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion
     };
   }
 
@@ -216,21 +218,18 @@
         documentId,
         revisionId: snapshot.revisionId,
         wordCount: snapshot.wordCount,
-        wordCounts: snapshot.wordCounts,
-        wordTokens: snapshot.wordTokens,
         wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        source: "google-docs-api"
       }
     });
 
     console.info("[ACE] SESSION START", {
-      measurementPath: "exact-api-sequence-diff",
+      measurementPath: "google-docs-net-count",
       documentId,
       extensionSessionId,
       revisionId: snapshot.revisionId || "",
-      apiWordCount: snapshot.wordCount,
-      tokenCount: snapshot.wordTokens.length,
-      wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion
+      apiWordCount: snapshot.wordCount
     });
 
     return {
@@ -239,13 +238,11 @@
       method: "google-docs-api",
       revisionId: snapshot.revisionId || "",
       wordCount: snapshot.wordCount,
-      wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion,
-      wordCounts: snapshot.wordCounts,
-      wordTokens: snapshot.wordTokens
+      wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion
     };
   }
 
-  async function aceFetchGoogleDocWordDiff(message) {
+  async function aceFetchGoogleDocNetCount(message) {
     const documentId = String(message.documentId || "").trim();
     const extensionSessionId = String(message.extensionSessionId || "").trim();
     if (!documentId || !extensionSessionId) {
@@ -253,9 +250,8 @@
         ok: false,
         status: 400,
         wordCount: null,
-        wordsAdded: 0,
-        wordsRemoved: 0,
-        error: "E-DIFF-INPUT: Google Docs document ID and session ID are required."
+        netWordsChanged: 0,
+        error: "E-NET-INPUT: Google Docs document ID and session ID are required."
       };
     }
 
@@ -264,64 +260,40 @@
         ok: false,
         status: 400,
         wordCount: null,
-        wordsAdded: 0,
-        wordsRemoved: 0,
+        netWordsChanged: 0,
         error: "E-GOOGLE-OAUTH-CONFIG: Google OAuth client ID is not configured."
       };
     }
 
     const stored = await aceStorageGet(aceSnapshotStorageKey(extensionSessionId));
     const startSnapshot = stored[aceSnapshotStorageKey(extensionSessionId)];
-    if (startSnapshot?.source === "visible-total-baseline") {
-      return {
-        ok: false,
-        status: 409,
-        wordCount: null,
-        wordsAdded: 0,
-        wordsRemoved: 0,
-        error: "E-VISIBLE-BASELINE: Session started from the visible Google Docs count because the extension context/API was unavailable. End measurement will use the visible count fallback if the API diff is unavailable."
-      };
-    }
-
-    if (!startSnapshot?.wordTokens || startSnapshot.documentId !== documentId) {
+    if (!Number.isFinite(Number(startSnapshot?.wordCount)) || startSnapshot.documentId !== documentId) {
       return {
         ok: false,
         status: 404,
         wordCount: null,
-        wordsAdded: 0,
-        wordsRemoved: 0,
-        error: "E-SNAPSHOT-MISSING: No Google API before token snapshot exists for this session. Reload the Google Doc after choosing a project, wait two seconds, then start a new session."
-      };
-    }
-
-    if (startSnapshot.wordCountTokenizerVersion !== ACE_WORD_TOKENIZER_VERSION) {
-      return {
-        ok: false,
-        status: 409,
-        wordCount: null,
-        wordsAdded: 0,
-        wordsRemoved: 0,
-        error: `E-TOKENIZER-VERSION: The before snapshot used ${startSnapshot.wordCountTokenizerVersion || "an old tokenizer"}, but this extension uses ${ACE_WORD_TOKENIZER_VERSION}. Start a new session so added/removed words can be compared accurately.`
+        netWordsChanged: 0,
+        error: "E-START-COUNT-MISSING: No start word count exists for this session. Reload the Google Doc after choosing a project, then start a new session."
       };
     }
 
     const endSnapshot = await aceFetchGoogleDocSnapshot(documentId, Boolean(message.interactive));
-    const diff = aceCompareWordTokens(startSnapshot.wordTokens, endSnapshot.wordTokens);
-
     if (message.clearSnapshot) {
       await aceStorageRemove(aceSnapshotStorageKey(extensionSessionId));
     }
 
-    console.info("[ACE] DIFF RESULT", {
-      measurementPath: diff.method || "exact-api-sequence-diff",
+    const startWordCount = Math.max(0, Number(startSnapshot.wordCount) || 0);
+    const endWordCount = Math.max(0, Number(endSnapshot.wordCount) || 0);
+    const netWordsChanged = endWordCount - startWordCount;
+    console.info("[ACE] NET WORD COUNT", {
+      measurementPath: "google-docs-net-count",
       documentId,
       extensionSessionId,
       startRevisionId: startSnapshot.revisionId || "",
       endRevisionId: endSnapshot.revisionId || "",
-      wordsAdded: diff.wordsAdded,
-      wordsRemoved: diff.wordsRemoved,
-      wordsEdited: diff.wordsAdded + diff.wordsRemoved,
-      netWordsChanged: endSnapshot.wordCount - startSnapshot.wordCount
+      startWordCount,
+      endWordCount,
+      netWordsChanged
     });
 
     return {
@@ -330,15 +302,10 @@
       method: "google-docs-api",
       revisionId: endSnapshot.revisionId || "",
       startRevisionId: startSnapshot.revisionId || "",
-      wordCount: endSnapshot.wordCount,
-      startWordCount: startSnapshot.wordCount,
-      endWordCounts: endSnapshot.wordCounts,
-      endWordTokens: endSnapshot.wordTokens,
-      wordCountTokenizerVersion: endSnapshot.wordCountTokenizerVersion,
-      wordsAdded: diff.wordsAdded,
-      wordsRemoved: diff.wordsRemoved,
-      netWordsChanged: endSnapshot.wordCount - startSnapshot.wordCount,
-      wordDiffMethod: diff.method
+      wordCount: endWordCount,
+      startWordCount,
+      netWordsChanged,
+      wordCountTokenizerVersion: endSnapshot.wordCountTokenizerVersion
     };
   }
 
@@ -376,31 +343,13 @@
     }
 
     const documentPayload = await response.json();
-    const extraction = aceExtractGoogleDocTextBySource(documentPayload);
-    const wordTokens = aceWordTokensInText(extraction.text);
-    const wordCounts = aceWordCountsFromTokens(wordTokens);
-    console.info("[ACE] API TEXT DIAGNOSTIC", {
-      documentId,
-      revisionId: documentPayload.revisionId || "",
-      suggestionsViewMode: ACE_GOOGLE_DOCS_SUGGESTIONS_VIEW_MODE,
-      extractedText: extraction.text,
-      tokenCount: wordTokens.length,
-      fullTokens: wordTokens,
-      first150Tokens: wordTokens.slice(0, 150),
-      final100Tokens: wordTokens.slice(-100),
-      last150Tokens: wordTokens.slice(-150),
-      suspiciousUnicodeRanges: aceSuspiciousUnicodeRanges(extraction.text),
-      sourceTokenCounts: aceSourceTokenCounts(extraction.sources),
-      sourceTextSamples: aceSourceTextSamples(extraction.sources),
-      duplicateTextHashes: aceDuplicateTextHashes(extraction.sources)
-    });
+    const text = aceExtractGoogleDocText(documentPayload);
+    const wordCount = aceCountWordsInText(text);
     return {
       status: response.status,
       revisionId: documentPayload.revisionId || "",
       wordCountTokenizerVersion: ACE_WORD_TOKENIZER_VERSION,
-      wordTokens,
-      wordCounts,
-      wordCount: wordTokens.length
+      wordCount
     };
   }
 
@@ -530,8 +479,6 @@
           });
         });
       }
-
-      // Google Docs' visible manuscript word count excludes generated table-of-contents text.
     }
 
     function collectStructuralElements(elements, source) {
@@ -596,116 +543,8 @@
     return chunks.join(" ");
   }
 
-  function aceSourceTokenCounts(sources) {
-    return Object.fromEntries(Object.entries(sources).map(function ([source, chunks]) {
-      return [source, aceWordTokensInText((chunks || []).join(" ")).length];
-    }));
-  }
-
-  function aceSourceTextSamples(sources) {
-    return Object.fromEntries(Object.entries(sources).map(function ([source, chunks]) {
-      const text = (chunks || []).join(" ").trim();
-      return [source, text ? text.slice(0, 500) : ""];
-    }));
-  }
-
-  function aceDuplicateTextHashes(sources) {
-    const seen = new Map();
-    Object.entries(sources || {}).forEach(function ([source, chunks]) {
-      (chunks || []).forEach(function (chunk, index) {
-        const text = String(chunk || "").trim();
-        if (!text) {
-          return;
-        }
-        const hash = aceSimpleHash(text);
-        const item = seen.get(hash) || {
-          hash,
-          tokenCount: aceWordTokensInText(text).length,
-          occurrences: []
-        };
-        item.occurrences.push({ source, index, sample: text.slice(0, 120) });
-        seen.set(hash, item);
-      });
-    });
-    return Array.from(seen.values()).filter(function (item) {
-      return item.occurrences.length > 1;
-    });
-  }
-
-  function aceSimpleHash(text) {
-    let hash = 2166136261;
-    for (let index = 0; index < text.length; index += 1) {
-      hash ^= text.charCodeAt(index);
-      hash = Math.imul(hash, 16777619);
-    }
-    return (hash >>> 0).toString(16);
-  }
-
-  function aceSuspiciousUnicodeRanges(text) {
-    const value = String(text || "");
-    const ranges = [];
-    for (let index = 0; index < value.length; index += 1) {
-      const codePoint = value.codePointAt(index);
-      const character = String.fromCodePoint(codePoint);
-      const name = aceSuspiciousUnicodeName(codePoint, character);
-      if (codePoint > 0xffff) {
-        index += 1;
-      }
-      if (!name) {
-        continue;
-      }
-      const start = Math.max(0, index - 24);
-      const end = Math.min(value.length, index + 25);
-      const context = value.slice(start, end);
-      ranges.push({
-        index,
-        codePoint: `U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}`,
-        name,
-        context,
-        contextCodePoints: Array.from(context).map(function (item) {
-          const itemCodePoint = item.codePointAt(0);
-          return `U+${itemCodePoint.toString(16).toUpperCase().padStart(4, "0")}`;
-        })
-      });
-    }
-    return ranges;
-  }
-
-  function aceSuspiciousUnicodeName(codePoint, character) {
-    const names = {
-      0x00ad: "SOFT HYPHEN",
-      0x00a0: "NO-BREAK SPACE",
-      0x2007: "FIGURE SPACE",
-      0x2009: "THIN SPACE",
-      0x202f: "NARROW NO-BREAK SPACE",
-      0x3000: "IDEOGRAPHIC SPACE",
-      0x200b: "ZERO WIDTH SPACE",
-      0x200c: "ZERO WIDTH NON-JOINER",
-      0x200d: "ZERO WIDTH JOINER",
-      0x2060: "WORD JOINER",
-      0xfeff: "ZERO WIDTH NO-BREAK SPACE"
-    };
-    if (names[codePoint]) {
-      return names[codePoint];
-    }
-    if (/\p{M}/u.test(character)) {
-      return "COMBINING MARK";
-    }
-    if (/\p{Script=Greek}/u.test(character)) {
-      return "GREEK CHARACTER";
-    }
-    if (/\p{Script=Cyrillic}/u.test(character)) {
-      return "CYRILLIC CHARACTER";
-    }
-    return "";
-  }
-
   function aceCountWordsInText(text) {
     return aceWordTokensInText(text).length;
-  }
-
-  function aceWordCountsInText(text) {
-    return aceWordCountsFromTokens(aceWordTokensInText(text));
   }
 
   function aceWordTokensInText(text) {
@@ -723,120 +562,16 @@
       });
   }
 
-  function aceWordCountsFromTokens(tokens) {
-    const counts = {};
-    (tokens || []).forEach(function (token) {
-      counts[token] = (counts[token] || 0) + 1;
-    });
-    return counts;
-  }
-
-  function aceTotalWordCounts(wordCounts) {
-    return Object.values(wordCounts || {}).reduce(function (total, count) {
-      return total + Math.max(0, Number(count) || 0);
-    }, 0);
-  }
-
-  function aceCompareWordCounts(startWordCounts, endWordCounts) {
-    const keys = new Set([
-      ...Object.keys(startWordCounts || {}),
-      ...Object.keys(endWordCounts || {})
-    ]);
-    let wordsAdded = 0;
-    let wordsRemoved = 0;
-
-    keys.forEach(function (key) {
-      const startCount = Math.max(0, Number(startWordCounts[key]) || 0);
-      const endCount = Math.max(0, Number(endWordCounts[key]) || 0);
-      if (endCount > startCount) {
-        wordsAdded += endCount - startCount;
-      } else if (startCount > endCount) {
-        wordsRemoved += startCount - endCount;
-      }
-    });
-
-    return { wordsAdded, wordsRemoved };
-  }
-
-  function aceCompareWordTokens(startTokens, endTokens) {
-    const before = Array.isArray(startTokens) ? startTokens : [];
-    const after = Array.isArray(endTokens) ? endTokens : [];
-    let prefixLength = 0;
-    while (
-      prefixLength < before.length
-      && prefixLength < after.length
-      && before[prefixLength] === after[prefixLength]
-    ) {
-      prefixLength += 1;
-    }
-
-    let beforeEnd = before.length;
-    let afterEnd = after.length;
-    while (
-      beforeEnd > prefixLength
-      && afterEnd > prefixLength
-      && before[beforeEnd - 1] === after[afterEnd - 1]
-    ) {
-      beforeEnd -= 1;
-      afterEnd -= 1;
-    }
-
-    const removedTokens = before.slice(prefixLength, beforeEnd);
-    const addedTokens = after.slice(prefixLength, afterEnd);
-    if (!removedTokens.length || !addedTokens.length) {
-      return {
-        wordsAdded: addedTokens.length,
-        wordsRemoved: removedTokens.length,
-        method: "google-api-token-sequence"
-      };
-    }
-
-    const cellCount = removedTokens.length * addedTokens.length;
-    if (cellCount > 2000000) {
-      return {
-        ...aceCompareWordCounts(
-          aceWordCountsFromTokens(removedTokens),
-          aceWordCountsFromTokens(addedTokens)
-        ),
-        method: "google-api-token-map-fallback"
-      };
-    }
-
-    const lcsLength = aceLongestCommonSubsequenceLength(removedTokens, addedTokens);
-    return {
-      wordsAdded: addedTokens.length - lcsLength,
-      wordsRemoved: removedTokens.length - lcsLength,
-      method: "google-api-token-sequence"
-    };
-  }
-
-  function aceLongestCommonSubsequenceLength(before, after) {
-    let previous = new Uint32Array(after.length + 1);
-    for (let beforeIndex = 0; beforeIndex < before.length; beforeIndex += 1) {
-      const current = new Uint32Array(after.length + 1);
-      for (let afterIndex = 0; afterIndex < after.length; afterIndex += 1) {
-        current[afterIndex + 1] = before[beforeIndex] === after[afterIndex]
-          ? previous[afterIndex] + 1
-          : Math.max(previous[afterIndex + 1], current[afterIndex]);
-      }
-      previous = current;
-    }
-    return previous[after.length];
-  }
-
   if (globalThis.__ACE_TEST_EXPORTS__) {
     Object.assign(globalThis.__ACE_TEST_EXPORTS__, {
       aceStoreGoogleDocStartSnapshot,
       aceFetchFromApp,
-      aceFetchGoogleDocWordDiff,
+      aceFetchGoogleDocNetCount,
       aceFetchGoogleDocSnapshot,
       aceExtractGoogleDocText,
       aceExtractGoogleDocTextBySource,
       aceWordTokensInText,
-      aceWordCountsInText,
-      aceSourceTokenCounts,
-      aceCompareWordTokens,
-      aceCompareWordCounts
+      aceCountWordsInText
     });
   }
 })();
