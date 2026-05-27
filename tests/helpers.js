@@ -48,10 +48,20 @@ function loadBackground(fixtures = [], options = {}) {
         }
         throw new Error("No mocked Google Docs response queued.");
       }
-      const payload = responses.shift();
+      const fixture = responses.shift();
+      const payload = fixture && Object.prototype.hasOwnProperty.call(fixture, "payload")
+        ? fixture.payload
+        : fixture;
+      const ok = fixture && Object.prototype.hasOwnProperty.call(fixture, "ok")
+        ? Boolean(fixture.ok)
+        : true;
+      const status = fixture && Object.prototype.hasOwnProperty.call(fixture, "status")
+        ? Number(fixture.status)
+        : 200;
       return {
-        ok: true,
-        status: 200,
+        ok,
+        status,
+        statusText: fixture?.statusText || "",
         json: async () => payload,
         text: async () => JSON.stringify(payload)
       };
@@ -111,6 +121,16 @@ function loadContent(options = {}) {
   const storage = { ...(options.initialStorage || {}) };
   const exports = {};
   const source = fs.readFileSync(path.resolve(__dirname, "..", "content.js"), "utf8");
+  const visibleWordCountElement = options.visibleWordCount === undefined ? null : {
+    textContent: `${Number(options.visibleWordCount) || 0} words`,
+    innerText: `${Number(options.visibleWordCount) || 0} words`,
+    parentElement: null,
+    closest() { return null; },
+    getAttribute() { return ""; },
+    getBoundingClientRect() {
+      return { left: 20, top: 690, right: 260, bottom: 744, width: 240, height: 54 };
+    }
+  };
   const fakeElement = () => ({
     setAttribute() {},
     appendChild() {},
@@ -127,31 +147,45 @@ function loadContent(options = {}) {
     href: "https://docs.google.com/document/d/doc-test/edit",
     pathname: "/document/d/doc-test/edit",
     search: "",
-    hash: ""
+    hash: "",
+    ...(options.location || {})
   };
   const window = {
     addEventListener() {},
     requestAnimationFrame(callback) { callback(); },
-    setInterval,
+    setInterval(callback, milliseconds) {
+      const handle = setInterval(callback, milliseconds);
+      handle.unref?.();
+      return handle;
+    },
     clearInterval,
     setTimeout,
     clearTimeout,
     innerWidth: 1024,
     innerHeight: 768,
+    frames: [],
     location
   };
   window.top = options.topFrame ? window : {};
+  const document = {
+    activeElement: null,
+    documentElement: { ...fakeElement(), clientWidth: 1024, clientHeight: 768 },
+    getElementById() { return null; },
+    createElement: fakeElement,
+    addEventListener() {},
+    querySelectorAll() {
+      return visibleWordCountElement ? [visibleWordCountElement] : [];
+    },
+    elementsFromPoint() {
+      return visibleWordCountElement ? [visibleWordCountElement] : [];
+    }
+  };
+  window.document = document;
   const context = {
     console,
     __ACE_TEST_EXPORTS__: exports,
     window,
-    document: {
-      activeElement: null,
-      documentElement: fakeElement(),
-      getElementById() { return null; },
-      createElement: fakeElement,
-      addEventListener() {}
-    },
+    document,
     navigator: { clipboard: null },
     sessionStorage: {
       getItem() { return null; },
@@ -160,7 +194,19 @@ function loadContent(options = {}) {
     chrome: {
       runtime: {
         lastError: null,
-        sendMessage() {}
+        sendMessage(message, callback) {
+          if (options.sendMessage) {
+            options.sendMessage(message, callback);
+            return;
+          }
+          if (callback) {
+            callback({
+              ok: false,
+              wordCount: null,
+              error: "No mocked runtime response queued."
+            });
+          }
+        }
       },
       storage: {
         local: {

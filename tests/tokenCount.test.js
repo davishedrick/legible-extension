@@ -178,6 +178,136 @@ test("tabs/body duplicate fixture counts tab content once", async () => {
   assert.equal(snapshot.wordCount, 4);
 });
 
+test("Google Docs API snapshot can isolate one requested tab", async () => {
+  const payload = {
+    revisionId: "tabs-2",
+    tabs: [
+      {
+        tabProperties: { tabId: "tab-a", title: "Tab A" },
+        documentTab: {
+          body: {
+            content: [
+              {
+                paragraph: {
+                  elements: [{ textRun: { content: "alpha beta\n" } }]
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        tabProperties: { tabId: "tab-b", title: "Tab B" },
+        documentTab: {
+          body: {
+            content: [
+              {
+                paragraph: {
+                  elements: [{ textRun: { content: "gamma delta epsilon\n" } }]
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  };
+  const { exports } = loadBackground([payload]);
+  const snapshot = await exports.aceFetchGoogleDocSnapshot("doc-test", false, "tab-b");
+
+  assert.equal(snapshot.wordCount, 3);
+  assert.equal(snapshot.tabId, "tab-b");
+});
+
+test("Google Docs API requested tab can be empty", async () => {
+  const payload = {
+    revisionId: "tabs-empty",
+    tabs: [
+      {
+        tabProperties: { tabId: "tab-empty", title: "Empty" },
+        documentTab: { body: { content: [] } }
+      }
+    ]
+  };
+  const { exports } = loadBackground([payload]);
+  const snapshot = await exports.aceFetchGoogleDocSnapshot("doc-test", false, "tab-empty");
+
+  assert.equal(snapshot.wordCount, 0);
+  assert.equal(snapshot.tabId, "tab-empty");
+});
+
+test("Google Docs API preserves 404 status for deleted documents", async () => {
+  const { exports } = loadBackground([
+    {
+      ok: false,
+      status: 404,
+      statusText: "Not Found",
+      payload: { error: { message: "Requested entity was not found." } }
+    }
+  ]);
+
+  await assert.rejects(
+    exports.aceFetchGoogleDocSnapshot("deleted-doc", false, "tab-a"),
+    (error) => {
+      assert.equal(error.status, 404);
+      assert.match(error.message, /E-GOOGLE-API-404/);
+      return true;
+    }
+  );
+});
+
+test("Google Docs API preserves 403 status for inaccessible documents", async () => {
+  const { exports } = loadBackground([
+    {
+      ok: false,
+      status: 403,
+      statusText: "Forbidden",
+      payload: { error: { message: "The caller does not have permission." } }
+    }
+  ]);
+
+  await assert.rejects(
+    exports.aceFetchGoogleDocSnapshot("forbidden-doc", false, "tab-a"),
+    (error) => {
+      assert.equal(error.status, 403);
+      assert.match(error.message, /E-GOOGLE-API-403/);
+      return true;
+    }
+  );
+});
+
+test("Google Docs API reports missing requested tab as 404", async () => {
+  const payload = {
+    revisionId: "tabs-missing",
+    tabs: [
+      {
+        tabProperties: { tabId: "tab-a", title: "Tab A" },
+        documentTab: {
+          body: {
+            content: [
+              {
+                paragraph: {
+                  elements: [{ textRun: { content: "alpha beta\n" } }]
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  };
+  const { exports } = loadBackground([payload]);
+
+  await assert.rejects(
+    exports.aceFetchGoogleDocSnapshot("doc-test", false, "missing-tab"),
+    (error) => {
+      assert.equal(error.status, 404);
+      assert.match(error.message, /E-GOOGLE-DOC-TAB-NOT-FOUND/);
+      return true;
+    }
+  );
+});
+
 test("suggested insertions are not counted in the final visible text", async () => {
   const payload = {
     revisionId: "suggestions-1",

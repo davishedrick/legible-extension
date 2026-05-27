@@ -28,6 +28,60 @@ function session(overrides = {}) {
   };
 }
 
+function catchUpSurface(overrides = {}) {
+  return {
+    documentId: "doc-test",
+    tabId: "tab-1",
+    tabTitle: "Tab 1",
+    manuscriptSurfaceId: "doc-test:tab-1",
+    manuscriptSurfaceLabel: "Tab 1",
+    ...overrides
+  };
+}
+
+function catchUpBaseline(count = 1000, overrides = {}) {
+  return {
+    ...catchUpSurface(),
+    projectId: "project-test",
+    endDocumentWordCount: count,
+    revisionId: "baseline-revision",
+    syncedAt: "2026-05-20T00:00:00.000Z",
+    ...overrides
+  };
+}
+
+function catchUpSnapshot(count, overrides = {}) {
+  return {
+    ok: true,
+    wordCount: count,
+    apiWordCount: count,
+    visibleWordCount: count,
+    currentCountSource: "stable-visible",
+    currentCountTrusted: true,
+    revisionId: "current-revision",
+    ...overrides
+  };
+}
+
+function evaluateCatchUp(exports, overrides = {}) {
+  const surface = overrides.surface || catchUpSurface();
+  return exports.aceEvaluateCatchUpCandidate({
+    trigger: "test",
+    surface,
+    baseline: Object.prototype.hasOwnProperty.call(overrides, "baseline")
+      ? overrides.baseline
+      : catchUpBaseline(1000, surface),
+    baselineKey: overrides.baselineKey || surface.manuscriptSurfaceId,
+    baselineIsLegacy: Boolean(overrides.baselineIsLegacy),
+    currentSnapshot: overrides.currentSnapshot || catchUpSnapshot(1200),
+    pendingSession: overrides.pendingSession || null,
+    completedSession: overrides.completedSession || null,
+    binding: Object.prototype.hasOwnProperty.call(overrides, "binding")
+      ? overrides.binding
+      : { projectId: "project-test", project: { id: "project-test", bookTitle: "Test Book" } }
+  });
+}
+
 test("sync payload uses net words and zeroes legacy added/removed fields", () => {
   const { exports } = loadContent();
   const payload = exports.aceSessionSyncPayload(session({
@@ -211,6 +265,404 @@ test("saving document baseline stores surface metadata", async () => {
   assert.equal(baseline.endDocumentWordCount, 814);
 });
 
+test("catch-up baseline lookup requires current manuscript surface", async () => {
+  const { exports, storage } = loadContent();
+  storage.aceDocumentBaselines = {
+    "doc-test:tabA": catchUpBaseline(1000, {
+      tabId: "tabA",
+      manuscriptSurfaceId: "doc-test:tabA"
+    })
+  };
+
+  const tabA = await exports.aceGetDocumentBaselineForCatchUp({
+    documentId: "doc-test",
+    tabId: "tabA",
+    manuscriptSurfaceId: "doc-test:tabA"
+  });
+  const tabB = await exports.aceGetDocumentBaselineForCatchUp({
+    documentId: "doc-test",
+    tabId: "tabB",
+    manuscriptSurfaceId: "doc-test:tabB"
+  });
+
+  assert.equal(tabA.baseline.endDocumentWordCount, 1000);
+  assert.equal(tabA.key, "doc-test:tabA");
+  assert.equal(tabB.baseline, null);
+  assert.equal(tabB.key, "doc-test:tabB");
+});
+
+test("catch-up decision allows trustworthy positive net", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1000),
+    currentSnapshot: catchUpSnapshot(1200)
+  });
+
+  assert.equal(result.candidate.netWordsChanged, 200);
+  assert.equal(result.candidate.sessionType, "writing");
+  assert.equal(result.trace.decision.action, "show-catch-up");
+  assert.equal(result.trace.decision.code, "D-CATCHUP-SHOW-POSITIVE");
+});
+
+test("catch-up decision allows trustworthy negative net", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1000),
+    currentSnapshot: catchUpSnapshot(900)
+  });
+
+  assert.equal(result.candidate.netWordsChanged, -100);
+  assert.equal(result.candidate.sessionType, "editing");
+  assert.equal(result.trace.decision.action, "show-catch-up");
+  assert.equal(result.trace.decision.code, "D-CATCHUP-SHOW-NEGATIVE");
+});
+
+test("catch-up decision allows full deletion to zero words", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1000),
+    currentSnapshot: catchUpSnapshot(0)
+  });
+
+  assert.equal(result.candidate.netWordsChanged, -1000);
+  assert.equal(result.candidate.sessionType, "editing");
+  assert.equal(result.candidate.startDocumentWordCount, 1000);
+  assert.equal(result.candidate.endDocumentWordCount, 0);
+  assert.equal(result.trace.decision.code, "D-CATCHUP-SHOW-NEGATIVE");
+});
+
+test("catch-up decision skips zero change", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1000),
+    currentSnapshot: catchUpSnapshot(1000)
+  });
+
+  assert.equal(result.candidate, null);
+  assert.equal(result.reason, "zero-net");
+  assert.equal(result.trace.decision.code, "D-CATCHUP-NET-ZERO");
+});
+
+test("catch-up decision skips zero-to-zero change", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(0),
+    currentSnapshot: catchUpSnapshot(0)
+  });
+
+  assert.equal(result.candidate, null);
+  assert.equal(result.reason, "zero-net");
+  assert.equal(result.trace.decision.code, "D-CATCHUP-NET-ZERO");
+});
+
+test("catch-up decision skips missing baseline", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: null,
+    currentSnapshot: catchUpSnapshot(1200)
+  });
+
+  assert.equal(result.candidate, null);
+  assert.equal(result.reason, "missing-baseline");
+  assert.equal(result.trace.decision.code, "D-CATCHUP-NO-BASELINE");
+});
+
+test("catch-up decision skips unbound surface", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1000),
+    currentSnapshot: catchUpSnapshot(1200),
+    binding: null
+  });
+
+  assert.equal(result.candidate, null);
+  assert.equal(result.reason, "no-binding");
+  assert.equal(result.trace.decision.code, "D-CATCHUP-NO-BINDING");
+});
+
+test("catch-up decision skips visible-unavailable API negative result", () => {
+  const { exports } = loadContent();
+  const diagnostic = exports.aceGoogleDocNetDiagnostic({
+    code: "D-CATCHUP-NO-STABLE-VISIBLE",
+    startWordCount: 1332,
+    apiEndWordCount: 1213,
+    visibleEndWordCount: null,
+    netWordsChanged: -119,
+    startSource: "saved-total-baseline",
+    endSource: "google-docs-api"
+  });
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1332),
+    currentSnapshot: catchUpSnapshot(null, {
+      ok: false,
+      skipCatchUp: true,
+      wordCount: null,
+      apiWordCount: 1213,
+      visibleWordCount: null,
+      currentCountSource: "none",
+      currentCountTrusted: false,
+      wordCountDiagnostic: diagnostic
+    })
+  });
+
+  assert.equal(result.candidate, null);
+  assert.equal(result.reason, "current-count-diagnostic-only");
+  assert.match(diagnostic, /visible end unavailable/);
+});
+
+test("catch-up decision trusts stable visible count over API mismatch", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1000),
+    currentSnapshot: catchUpSnapshot(1200, {
+      apiWordCount: 1213,
+      visibleWordCount: 1200,
+      currentCountSource: "stable-visible",
+      currentCountTrusted: true,
+      apiVisibleMismatch: true
+    })
+  });
+
+  assert.equal(result.candidate.netWordsChanged, 200);
+  assert.equal(result.trace.currentCounts.apiCount, 1213);
+  assert.equal(result.trace.currentCounts.selectedVisibleCount, 1200);
+  assert.equal(result.trace.decision.action, "show-catch-up");
+});
+
+test("stable visible count ignores early zero reads for catch-up", async () => {
+  const { exports } = loadContent();
+  const reads = [0, 0, 1332, 1332];
+  const result = await exports.aceStableVisibleGoogleDocWordCount({
+    delayMs: 0,
+    timeoutMs: 100,
+    ignoreZero: true,
+    readVisibleCount: async () => {
+      const count = reads.shift();
+      return {
+        count,
+        candidates: [{ count, snippet: `${count} words`, score: count }],
+        selectedCandidate: { count, snippet: `${count} words`, score: count }
+      };
+    }
+  });
+
+  assert.equal(result.count, 1332);
+  assert.equal(result.stable, true);
+});
+
+test("catch-up current count treats stable visible zero as valid", async () => {
+  const { exports } = loadContent();
+  const reads = [0, 0];
+  const result = await exports.aceGoogleDocWordCountAfterSettle("doc-test", catchUpBaseline(1000), {
+    settleDelayMs: 0,
+    visibleDelayMs: 0,
+    visibleTimeoutMs: 100,
+    readVisibleCount: async () => {
+      const count = reads.shift();
+      return {
+        count,
+        candidates: [{ count, snippet: `${count} words` }],
+        selectedCandidate: { count, snippet: `${count} words` }
+      };
+    },
+    apiCall: async () => ({ ok: true, wordCount: 0, revisionId: "empty-doc" })
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.wordCount, 0);
+  assert.equal(result.visibleWordCount, 0);
+  assert.equal(result.netWordsChanged, -1000);
+  assert.equal(result.currentCountTrusted, true);
+});
+
+test("catch-up decision skips positive API without stable visible count", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1000),
+    currentSnapshot: catchUpSnapshot(null, {
+      ok: false,
+      skipCatchUp: true,
+      wordCount: null,
+      apiWordCount: 1200,
+      visibleWordCount: null,
+      currentCountSource: "none",
+      currentCountTrusted: false
+    })
+  });
+
+  assert.equal(result.candidate, null);
+  assert.equal(result.reason, "current-count-diagnostic-only");
+});
+
+test("catch-up decision skips baseline surface mismatch", () => {
+  const { exports } = loadContent();
+  const surface = catchUpSurface({
+    tabId: "tab-2",
+    tabTitle: "Tab 2",
+    manuscriptSurfaceId: "doc-test:tab-2"
+  });
+  const result = evaluateCatchUp(exports, {
+    surface,
+    baseline: catchUpBaseline(1000, {
+      tabId: "tab-1",
+      tabTitle: "Tab 1",
+      manuscriptSurfaceId: "doc-test:tab-1"
+    }),
+    baselineKey: "doc-test:tab-1",
+    currentSnapshot: catchUpSnapshot(1200)
+  });
+
+  assert.equal(result.candidate, null);
+  assert.equal(result.reason, "baseline-surface-mismatch");
+});
+
+test("catch-up decision skips when pending session covers surface", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    pendingSession: session({
+      tabId: "tab-1",
+      manuscriptSurfaceId: "doc-test:tab-1",
+      startDocumentWordCount: 1000,
+      endDocumentWordCount: 1200,
+      source: "catch-up"
+    })
+  });
+
+  assert.equal(result.candidate, null);
+  assert.equal(result.reason, "pending-or-completed-session-exists");
+});
+
+test("negative catch-up creates editing session payload", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1000),
+    currentSnapshot: catchUpSnapshot(900)
+  });
+  const payload = exports.aceBuildCatchUpSession(result.candidate, "project-test", Date.parse("2026-05-20T00:02:00.000Z"));
+
+  assert.equal(payload.sessionType, "editing");
+  assert.equal(payload.source, "catch-up");
+  assert.equal(payload.netWordsChanged, -100);
+  assert.equal(payload.wordsWritten, 0);
+  assert.equal(payload.startDocumentWordCount, 1000);
+  assert.equal(payload.endDocumentWordCount, 900);
+  assert.equal(payload.durationMinutes, 1);
+});
+
+test("full deletion catch-up creates editing session payload", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1000),
+    currentSnapshot: catchUpSnapshot(0)
+  });
+  const payload = exports.aceBuildCatchUpSession(result.candidate, "project-test", Date.parse("2026-05-20T00:02:00.000Z"));
+
+  assert.equal(payload.sessionType, "editing");
+  assert.equal(payload.source, "catch-up");
+  assert.equal(payload.netWordsChanged, -1000);
+  assert.equal(payload.startDocumentWordCount, 1000);
+  assert.equal(payload.endDocumentWordCount, 0);
+});
+
+test("positive catch-up creates writing session payload", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1000),
+    currentSnapshot: catchUpSnapshot(1200)
+  });
+  const payload = exports.aceBuildCatchUpSession(result.candidate, "project-test", Date.parse("2026-05-20T00:02:00.000Z"));
+
+  assert.equal(payload.sessionType, "writing");
+  assert.equal(payload.source, "catch-up");
+  assert.equal(payload.netWordsChanged, 200);
+  assert.equal(payload.wordsWritten, 200);
+  assert.equal(payload.startDocumentWordCount, 1000);
+  assert.equal(payload.endDocumentWordCount, 1200);
+});
+
+test("skipping catch-up updates baseline to current count", async () => {
+  const { exports, storage } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1000),
+    currentSnapshot: catchUpSnapshot(1200)
+  });
+
+  await exports.aceSaveSkippedCatchUpBaseline(result.candidate);
+
+  assert.equal(storage.aceDocumentBaselines["doc-test:tab-1"].endDocumentWordCount, 1200);
+  assert.equal(storage.aceDocumentBaselines["doc-test:tab-1"].wordCountMethod, "stable-visible");
+});
+
+test("skipping full deletion updates baseline to zero", async () => {
+  const { exports, storage } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1000),
+    currentSnapshot: catchUpSnapshot(0)
+  });
+
+  await exports.aceSaveSkippedCatchUpBaseline(result.candidate);
+
+  assert.equal(storage.aceDocumentBaselines["doc-test:tab-1"].endDocumentWordCount, 0);
+  assert.equal(storage.aceDocumentBaselines["doc-test:tab-1"].wordCountMethod, "stable-visible");
+});
+
+test("normal session baseline sync updates baseline to session end", async () => {
+  const { exports, storage } = loadContent();
+
+  await exports.aceSaveDocumentBaseline(session({
+    tabId: "tab-1",
+    tabTitle: "Tab 1",
+    manuscriptSurfaceId: "doc-test:tab-1",
+    endDocumentWordCount: 1300
+  }), { id: "project-test" });
+
+  assert.equal(storage.aceDocumentBaselines["doc-test:tab-1"].endDocumentWordCount, 1300);
+});
+
+test("start snapshot accepts API word count zero", async () => {
+  const messages = [];
+  const { exports } = loadContent({
+    sendMessage(message, callback) {
+      messages.push(message);
+      callback({
+        ok: true,
+        status: 200,
+        method: "google-docs-api",
+        revisionId: "empty-doc",
+        wordCount: 0,
+        wordCountTokenizerVersion: "test-tokenizer"
+      });
+    }
+  });
+
+  const snapshot = await exports.aceStartSnapshotWithVisibleFallback(
+    "doc-test",
+    "session-zero",
+    true,
+    "test start",
+    { allowVisibleFallback: true }
+  );
+
+  assert.equal(snapshot.ok, true);
+  assert.equal(snapshot.wordCount, 0);
+  assert.equal(messages[0].extensionSessionId, "session-zero");
+});
+
+test("baseline start snapshot accepts zero and stores under session id", async () => {
+  const { exports, storage } = loadContent();
+
+  const snapshot = await exports.aceSeedGoogleDocStartSnapshotFromBaseline(
+    "doc-test",
+    "session-zero",
+    catchUpBaseline(0)
+  );
+
+  assert.equal(snapshot.ok, true);
+  assert.equal(snapshot.wordCount, 0);
+  assert.equal(storage["aceWordSnapshot:session-zero"].wordCount, 0);
+  assert.equal(storage["aceWordSnapshot:session-zero"].documentId, "doc-test");
+});
+
 test("restoring a pending session uses the pending session project", async () => {
   const { exports, storage } = loadContent({ topFrame: true });
   await new Promise((resolve) => setImmediate(resolve));
@@ -263,6 +715,111 @@ test("active session surface mismatch is detected", () => {
     tabId: "tabA",
     manuscriptSurfaceId: "doc123:tabA"
   }), false);
+});
+
+test("tab switch refresh clears previous bound prompt state", async () => {
+  const { exports, storage, context } = loadContent({
+    topFrame: true,
+    location: {
+      href: "https://docs.google.com/document/d/doc-test/edit#tab=tabA&tabTitle=Tab%20A",
+      hash: "#tab=tabA&tabTitle=Tab%20A"
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  storage.aceDocumentBindings = {
+    "doc-test:tabA": {
+      documentId: "doc-test",
+      tabId: "tabA",
+      tabTitle: "Tab A",
+      manuscriptSurfaceId: "doc-test:tabA",
+      projectId: "project-a",
+      project: { id: "project-a", bookTitle: "Project A" }
+    }
+  };
+
+  await exports.aceRefreshStateForSurfaceSwitch(exports.aceCurrentManuscriptSurface(), "test");
+  assert.equal(exports.aceTestState().currentBinding.projectId, "project-a");
+
+  context.location.hash = "#tab=tabB&tabTitle=Tab%20B";
+  context.location.href = "https://docs.google.com/document/d/doc-test/edit#tab=tabB&tabTitle=Tab%20B";
+  await exports.aceHandleSurfaceLifecycleChange("test-tab-switch");
+
+  const state = exports.aceTestState();
+  assert.equal(state.currentSurface.manuscriptSurfaceId, "doc-test:tabB");
+  assert.equal(state.currentBinding, null);
+  assert.equal(state.catchUpCandidate, null);
+  assert.match(state.widgetHtml, /Not bound/);
+  assert.match(state.widgetHtml, /Tab B/);
+  assert.doesNotMatch(state.widgetHtml, /Project A/);
+});
+
+test("active session blocks on tab switch and resumes on original tab", async () => {
+  const activeSession = session({
+    tabId: "tabA",
+    tabTitle: "Tab A",
+    manuscriptSurfaceId: "doc-test:tabA",
+    manuscriptSurfaceLabel: "Tab A",
+    startedAt: new Date(Date.now() - 60000).toISOString(),
+    project: { id: "project-a", bookTitle: "Project A" },
+    projectId: "project-a"
+  });
+  const { exports, context } = loadContent({
+    topFrame: true,
+    initialStorage: { aceActiveSession: activeSession },
+    location: {
+      href: "https://docs.google.com/document/d/doc-test/edit#tab=tabA&tabTitle=Tab%20A",
+      hash: "#tab=tabA&tabTitle=Tab%20A"
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await exports.aceHandleSurfaceLifecycleChange("test-init");
+
+  context.location.hash = "#tab=tabB&tabTitle=Tab%20B";
+  context.location.href = "https://docs.google.com/document/d/doc-test/edit#tab=tabB&tabTitle=Tab%20B";
+  await exports.aceHandleSurfaceLifecycleChange("test-tab-switch");
+
+  let state = exports.aceTestState();
+  assert.equal(state.state, "tab-blocked");
+  assert.equal(Boolean(state.activeSession.tabBlockedAt), true);
+  assert.match(state.widgetHtml, /Tab changed/);
+  assert.match(state.widgetHtml, /Tab A/);
+
+  context.location.hash = "#tab=tabA&tabTitle=Tab%20A";
+  context.location.href = "https://docs.google.com/document/d/doc-test/edit#tab=tabA&tabTitle=Tab%20A";
+  await exports.aceHandleSurfaceLifecycleChange("test-tab-return");
+
+  state = exports.aceTestState();
+  assert.equal(state.state, "active");
+  assert.equal(state.activeSession.tabBlockedAt, "");
+  assert(state.activeSession.pausedDurationMs >= 0);
+});
+
+test("tab title rename keeps surface id and updates active session metadata", async () => {
+  const activeSession = session({
+    tabId: "tabA",
+    tabTitle: "Old Title",
+    manuscriptSurfaceId: "doc-test:tabA",
+    manuscriptSurfaceLabel: "Old Title",
+    startedAt: new Date(Date.now() - 60000).toISOString()
+  });
+  const { exports, context } = loadContent({
+    topFrame: true,
+    initialStorage: { aceActiveSession: activeSession },
+    location: {
+      href: "https://docs.google.com/document/d/doc-test/edit#tab=tabA&tabTitle=Old%20Title",
+      hash: "#tab=tabA&tabTitle=Old%20Title"
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await exports.aceHandleSurfaceLifecycleChange("test-init");
+
+  context.location.hash = "#tab=tabA&tabTitle=New%20Title";
+  context.location.href = "https://docs.google.com/document/d/doc-test/edit#tab=tabA&tabTitle=New%20Title";
+  await exports.aceHandleSurfaceLifecycleChange("test-title-rename");
+
+  const state = exports.aceTestState();
+  assert.equal(state.activeSession.manuscriptSurfaceId, "doc-test:tabA");
+  assert.equal(state.activeSession.tabTitle, "New Title");
 });
 
 test("net words are computed from start and end counts", () => {
@@ -411,6 +968,179 @@ test("stable visible word count uses the latest stable value", async () => {
   assert.equal(result.count, 2209);
   assert.equal(result.stable, true);
   assert.match(result.diagnostic, /W-VISIBLE-COUNT-CHANGED/);
+});
+
+test("stable visible word count finishes after two matching reads", async () => {
+  const { exports } = loadContent();
+  const reads = [2209, 2209, 2210, 2210];
+
+  const result = await exports.aceStableVisibleGoogleDocWordCount({
+    delayMs: 0,
+    timeoutMs: 100,
+    readVisibleCount: async () => {
+      const count = reads.shift();
+      return {
+        count,
+        candidates: [{ count, snippet: `${count} words` }],
+        selectedCandidate: { count, snippet: `${count} words` }
+      };
+    }
+  });
+
+  assert.equal(result.count, 2209);
+  assert.equal(result.stable, true);
+  assert.equal(result.readCount, 2);
+});
+
+test("session end uses stable visible count without waiting for slow API", async () => {
+  const { exports } = loadContent();
+  const reads = [2209, 2209];
+  let apiFinished = false;
+
+  const result = await exports.aceGoogleDocNetAfterSave(
+    "doc-test",
+    "session-test",
+    1000,
+    "start-revision",
+    true,
+    {
+      settleDelayMs: 0,
+      visibleDelayMs: 0,
+      visibleTimeoutMs: 100,
+      readVisibleCount: async () => {
+        const count = reads.shift();
+        return {
+          count,
+          candidates: [{ count, snippet: `${count} words` }],
+          selectedCandidate: { count, snippet: `${count} words` }
+        };
+      },
+      apiCall: () => new Promise((resolve) => {
+        setTimeout(() => {
+          apiFinished = true;
+          resolve({ ok: true, wordCount: 2208, revisionId: "api-revision" });
+        }, 50);
+      })
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.wordCount, 2209);
+  assert.equal(result.netWordsChanged, 1209);
+  assert.equal(result.method, "stable-visible-count");
+  assert.equal(result.timing.apiAttempts, 1);
+  assert.equal(apiFinished, false);
+});
+
+test("session end records API mismatch but keeps stable visible count", async () => {
+  const { exports } = loadContent();
+  const reads = [2209, 2209];
+
+  const result = await exports.aceGoogleDocNetAfterSave(
+    "doc-test",
+    "session-test",
+    1000,
+    "start-revision",
+    true,
+    {
+      settleDelayMs: 0,
+      visibleDelayMs: 0,
+      visibleTimeoutMs: 100,
+      readVisibleCount: async () => {
+        const count = reads.shift();
+        return {
+          count,
+          candidates: [{ count, snippet: `${count} words` }],
+          selectedCandidate: { count, snippet: `${count} words` }
+        };
+      },
+      apiCall: async () => ({ ok: true, wordCount: 2208, revisionId: "api-revision" })
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.wordCount, 2209);
+  assert.match(result.wordCountDiagnostic, /W-API-VISIBLE-MISMATCH|D-STABLE-VISIBLE-NET/);
+});
+
+test("session end can use API only when surface is explicitly trusted", async () => {
+  const { exports } = loadContent();
+
+  const result = await exports.aceGoogleDocNetAfterSave(
+    "doc-test",
+    "session-test",
+    1000,
+    "start-revision",
+    true,
+    {
+      settleDelayMs: 0,
+      visibleDelayMs: 0,
+      visibleTimeoutMs: 0,
+      apiSurfaceTrusted: true,
+      readVisibleCount: async () => ({ count: null, candidates: [], selectedCandidate: null }),
+      apiCall: async () => ({ ok: true, wordCount: 1200, revisionId: "api-revision" })
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.wordCount, 1200);
+  assert.equal(result.netWordsChanged, 200);
+  assert.match(result.wordCountDiagnostic, /D-API-FALLBACK-NET/);
+});
+
+test("session end does not use untrusted API when visible is unavailable", async () => {
+  const { exports } = loadContent();
+
+  const result = await exports.aceGoogleDocNetAfterSave(
+    "doc-test",
+    "session-test",
+    1000,
+    "start-revision",
+    true,
+    {
+      settleDelayMs: 0,
+      visibleDelayMs: 0,
+      visibleTimeoutMs: 0,
+      readVisibleCount: async () => ({ count: null, candidates: [], selectedCandidate: null }),
+      apiCall: async () => ({ ok: true, wordCount: 1200, revisionId: "api-revision" })
+    }
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.wordCount, null);
+  assert.match(result.wordCountDiagnostic, /E-NO-TRUSTED-END-COUNT/);
+});
+
+test("catch-up check uses stable visible count for positive and negative changes", async () => {
+  const { exports } = loadContent();
+  const positiveReads = [1200, 1200];
+  const positive = await exports.aceGoogleDocWordCountAfterSettle("doc-test", catchUpBaseline(1000), {
+    settleDelayMs: 0,
+    visibleDelayMs: 0,
+    visibleTimeoutMs: 100,
+    readVisibleCount: async () => {
+      const count = positiveReads.shift();
+      return { count, candidates: [{ count }], selectedCandidate: { count } };
+    },
+    apiCall: async () => ({ ok: true, wordCount: 1200 })
+  });
+
+  const negativeReads = [900, 900];
+  const negative = await exports.aceGoogleDocWordCountAfterSettle("doc-test", catchUpBaseline(1000), {
+    settleDelayMs: 0,
+    visibleDelayMs: 0,
+    visibleTimeoutMs: 100,
+    readVisibleCount: async () => {
+      const count = negativeReads.shift();
+      return { count, candidates: [{ count }], selectedCandidate: { count } };
+    },
+    apiCall: async () => ({ ok: true, wordCount: 900 })
+  });
+
+  assert.equal(positive.ok, true);
+  assert.equal(positive.netWordsChanged, 200);
+  assert.equal(negative.ok, true);
+  assert.equal(negative.netWordsChanged, -100);
 });
 
 test("conflicting visible candidates prefer the bottom-left current counter", () => {

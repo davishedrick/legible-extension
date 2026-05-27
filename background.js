@@ -38,7 +38,7 @@
           console.warn("[ACE] Google Docs word count failed", error);
           sendResponse({
             ok: false,
-            status: 0,
+            status: Number(error?.status) || 0,
             wordCount: null,
             error: error.message || "Google Docs word count failed."
           });
@@ -53,7 +53,7 @@
           console.warn("[ACE] Google Docs start snapshot failed", error);
           sendResponse({
             ok: false,
-            status: 0,
+            status: Number(error?.status) || 0,
             wordCount: null,
             error: error.message || "Google Docs start snapshot failed."
           });
@@ -68,7 +68,7 @@
           console.warn("[ACE] Google Docs net count failed", error);
           sendResponse({
             ok: false,
-            status: 0,
+            status: Number(error?.status) || 0,
             wordCount: null,
             netWordsChanged: 0,
             error: error.message || "Google Docs net count failed."
@@ -173,7 +173,7 @@
       };
     }
 
-    const snapshot = await aceFetchGoogleDocSnapshot(documentId, Boolean(message.interactive));
+    const snapshot = await aceFetchGoogleDocSnapshot(documentId, Boolean(message.interactive), message.tabId);
     console.info("[ACE] GOOGLE DOC WORD COUNT", {
       measurementPath: "google-docs-net-count",
       documentId,
@@ -186,6 +186,7 @@
       status: snapshot.status,
       method: "google-docs-api",
       revisionId: snapshot.revisionId || "",
+      tabId: snapshot.tabId || "",
       wordCount: snapshot.wordCount,
       wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion
     };
@@ -212,12 +213,13 @@
       };
     }
 
-    const snapshot = await aceFetchGoogleDocSnapshot(documentId, Boolean(message.interactive));
+    const snapshot = await aceFetchGoogleDocSnapshot(documentId, Boolean(message.interactive), message.tabId);
     await aceStorageSet({
       [aceSnapshotStorageKey(extensionSessionId)]: {
         documentId,
         revisionId: snapshot.revisionId,
         wordCount: snapshot.wordCount,
+        tabId: snapshot.tabId || "",
         wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion,
         createdAt: new Date().toISOString(),
         source: "google-docs-api"
@@ -237,6 +239,7 @@
       status: snapshot.status,
       method: "google-docs-api",
       revisionId: snapshot.revisionId || "",
+      tabId: snapshot.tabId || "",
       wordCount: snapshot.wordCount,
       wordCountTokenizerVersion: snapshot.wordCountTokenizerVersion
     };
@@ -277,7 +280,7 @@
       };
     }
 
-    const endSnapshot = await aceFetchGoogleDocSnapshot(documentId, Boolean(message.interactive));
+    const endSnapshot = await aceFetchGoogleDocSnapshot(documentId, Boolean(message.interactive), message.tabId);
     if (message.clearSnapshot) {
       await aceStorageRemove(aceSnapshotStorageKey(extensionSessionId));
     }
@@ -302,6 +305,7 @@
       method: "google-docs-api",
       revisionId: endSnapshot.revisionId || "",
       startRevisionId: startSnapshot.revisionId || "",
+      tabId: endSnapshot.tabId || "",
       wordCount: endWordCount,
       startWordCount,
       netWordsChanged,
@@ -309,7 +313,7 @@
     };
   }
 
-  async function aceFetchGoogleDocSnapshot(documentId, interactive) {
+  async function aceFetchGoogleDocSnapshot(documentId, interactive, tabId = "") {
     const token = await aceGetGoogleAuthToken(interactive);
     const params = new URLSearchParams({
       includeTabsContent: "true",
@@ -343,12 +347,19 @@
     }
 
     const documentPayload = await response.json();
-    const text = aceExtractGoogleDocText(documentPayload);
+    const extracted = aceExtractGoogleDocTextBySource(documentPayload, tabId);
+    if (extracted.requestedTabId && extracted.requestedTabId !== "default" && !extracted.tabMatched) {
+      const failure = new Error("E-GOOGLE-DOC-TAB-NOT-FOUND: Active Google Docs tab was not found in the API payload.");
+      failure.status = 404;
+      throw failure;
+    }
+    const text = extracted.text;
     const wordCount = aceCountWordsInText(text);
     return {
       status: response.status,
       revisionId: documentPayload.revisionId || "",
       wordCountTokenizerVersion: ACE_WORD_TOKENIZER_VERSION,
+      tabId: extracted.requestedTabId || "",
       wordCount
     };
   }
@@ -414,12 +425,14 @@
     return `${ACE_WORD_SNAPSHOT_STORAGE_PREFIX}${extensionSessionId}`;
   }
 
-  function aceExtractGoogleDocText(documentPayload) {
-    return aceExtractGoogleDocTextBySource(documentPayload).text;
+  function aceExtractGoogleDocText(documentPayload, tabId = "") {
+    return aceExtractGoogleDocTextBySource(documentPayload, tabId).text;
   }
 
-  function aceExtractGoogleDocTextBySource(documentPayload) {
+  function aceExtractGoogleDocTextBySource(documentPayload, tabId = "") {
     const chunks = [];
+    const requestedTabId = String(tabId || "").trim();
+    let requestedTabMatched = !requestedTabId || requestedTabId === "default";
     const sources = {
       body: [],
       tabs: [],
@@ -504,20 +517,53 @@
       });
     }
 
+    function googleDocTabId(tab) {
+      return String(
+        tab?.tabProperties?.tabId
+        || tab?.tabProperties?.id
+        || tab?.documentTab?.tabId
+        || tab?.documentTab?.id
+        || tab?.id
+        || ""
+      ).trim();
+    }
+
+    function tabMatchesRequested(tab) {
+      return requestedTabId && requestedTabId !== "default" && googleDocTabId(tab) === requestedTabId;
+    }
+
     function collectTab(tab) {
       collectDocumentTab(tab?.documentTab, "tabs");
       (tab?.childTabs || []).forEach(collectTab);
     }
 
     if (Array.isArray(documentPayload.tabs) && documentPayload.tabs.length) {
-      documentPayload.tabs.forEach(collectTab);
+      if (requestedTabId && requestedTabId !== "default") {
+        const matchingTabs = [];
+        (function findTabs(tabs) {
+          (tabs || []).forEach(function (tab) {
+            if (tabMatchesRequested(tab)) {
+              requestedTabMatched = true;
+              matchingTabs.push(tab);
+            }
+            findTabs(tab?.childTabs || []);
+          });
+        })(documentPayload.tabs);
+        matchingTabs.forEach(function (tab) {
+          collectDocumentTab(tab?.documentTab, "tabs");
+        });
+      } else {
+        documentPayload.tabs.forEach(collectTab);
+      }
     } else {
       collectDocumentTab(documentPayload, "body");
     }
 
     return {
       text: chunks.join(" "),
-      sources
+      sources,
+      requestedTabId,
+      tabMatched: requestedTabMatched
     };
   }
 
