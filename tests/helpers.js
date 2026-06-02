@@ -195,6 +195,16 @@ function loadContent(options = {}) {
       runtime: {
         lastError: null,
         sendMessage(message, callback) {
+          if (message.aceType === "ace-current-tab-scope") {
+            if (callback) {
+              callback({
+                ok: true,
+                chromeTabId: options.chromeTabId ?? 1,
+                frameId: 0
+              });
+            }
+            return;
+          }
           if (options.sendMessage) {
             options.sendMessage(message, callback);
             return;

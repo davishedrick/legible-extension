@@ -82,6 +82,27 @@ The extension requests `https://www.googleapis.com/auth/documents.readonly` only
 - Reload the Google Doc mid-session, end it, and confirm it still syncs correctly.
 - Simulate API failure, confirm the session is retained as unsynced, then retry after the app is reachable.
 
+## Deleted binding QA checklist
+
+- Test A: Bind Project A to Google Doc 1, delete or remove access to Google Doc 1, then open/refresh the extension. Expected: Project A is no longer actively bound, has a deleted/stale binding marker, Google Doc 1 is not treated as active, and the hosted app state is updated.
+- Test B: With Project A marked as previously bound to deleted Google Doc 1, open Google Doc 2 and attempt to bind Project A. Expected: the prompt says `This project was bound to a now-deleted file. Update this project to your current tab?`; clicking `Yes` binds Project A to Google Doc 2, clears the deleted marker, updates the hosted app, saves the current word count as the new baseline, and shows no catch-up prompt.
+- Test C: Repeat Test B and click `No`. Expected: Project A remains unbound, Google Doc 2 is not sent as the active binding, no baseline is saved for Google Doc 2, and no session or catch-up prompt is created.
+- Test D: Bind Project A to accessible Google Doc 1 and refresh. Expected: Project A remains bound, no deleted marker appears, and no rebind prompt appears.
+- Test E: Bind Project A to accessible Google Doc 1, then open Google Doc 2 and attempt to bind Project A. Expected: the extension does not silently overwrite the active binding; canceling leaves Project A bound to Google Doc 1.
+- Test F: Rebind Project A from deleted Google Doc 1 with old baseline `1000` to Google Doc 2 with `397` words. Expected: the new baseline is `397`, no `+/-603` catch-up appears, and future catch-up compares against `397`.
+- Test G: After every bind, unbind, or rebind, confirm active binding and deleted binding are not both set for the same deleted doc, unbound projects are not treated as bound, and the current tab is treated as bound only after confirming `Yes`.
+
+## Catch-up QA checklist
+
+- Test A: Bind a project to a document with `397` words and no prior baseline. Expected: catch-up appears immediately during bind, not later; log or skip advances the baseline to `397`.
+- Test B: With baseline `0` and document count `500`, click `Start writing` or `Start editing`. Expected: catch-up appears before the tracked session starts; after log/skip, the session starts from `500`.
+- Test C: Type continuously outside a tracked session. Expected: no catch-up prompt appears during active typing.
+- Test D: Start a tracked session and keep writing. Expected: no catch-up prompt appears while the timer is running.
+- Test E: Skip catch-up. Expected: baseline updates to the current count and the same prompt does not reappear.
+- Test F: Click `Sync document changes` after editing outside a session. Expected: reconciliation runs on demand and baseline updates after log/skip.
+- Test G: Keep typing within the 15 second suppression window. Expected: no automatic catch-up prompt appears.
+- Test H: Confirm delta direction: baseline `100`, current `600` shows `+500`; baseline `600`, current `100` shows `-500`.
+
 ## Notes
 
 This extension is intentionally a passive trigger layer. When Google OAuth is configured, it reads the Google Doc through the official read-only Docs API to calculate before/after word counts, then syncs only session metadata to Scriptor:

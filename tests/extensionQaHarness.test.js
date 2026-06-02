@@ -134,7 +134,7 @@ test("server binding reconciliation replaces stale local project metadata", asyn
   assert.equal(storage.aceDocumentBindings[surface.manuscriptSurfaceId].projectId, "project-server");
 });
 
-test("project picker marks deleted document binding as stale and shows clear action", async () => {
+test("project picker marks deleted document binding as unbound with deleted marker", async () => {
   const surface = surfaceFactory({ documentId: "deleted-doc", tabId: "tab-a", tabTitle: "Deleted Tab" });
   const project = projectFactory({ id: "project-deleted", bookTitle: "Deleted Project" });
   const routeCalls = [];
@@ -161,7 +161,9 @@ test("project picker marks deleted document binding as stale and shows clear act
   ]);
 
   assert.equal(projects[0].bindingStatus, "stale_missing_doc");
-  assert.equal(projects[0].isBound, true);
+  assert.equal(projects[0].isBound, false);
+  assert.equal(projects[0].binding, null);
+  assert.equal(projects[0].deletedBinding.documentId, "deleted-doc");
   assert.match(exports.aceProjectPickerStatusLabel(projects[0]), /missing doc/);
   assert.equal(routeCalls[0].options.method, "PATCH");
 });
@@ -272,6 +274,108 @@ test("clearing stale binding removes backend and local binding without touching 
   assert.equal(backend.calls[0].options.method, "DELETE");
 });
 
+test("deleted binding project asks before rebinding and yes refreshes baseline", async () => {
+  const deletedSurface = surfaceFactory({ documentId: "deleted-doc", tabId: "tab-a", tabTitle: "Deleted Tab" });
+  const currentSurface = surfaceFactory({ documentId: "new-doc", tabId: "tab-b", tabTitle: "New Tab" });
+  const project = projectFactory({ id: "project-rebind", bookTitle: "Rebind Project" });
+  const backend = createBackendMock({
+    "PUT /api/extension/document-binding": { project }
+  });
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    visibleWordCount: 397,
+    location: locationForSurface(currentSurface),
+    sendMessage: backend.sendMessage
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  exports.aceSetTestState({
+    state: "project-picker",
+    projectPickerMode: "bind",
+    currentSurface,
+    projects: [
+      {
+        project,
+        isBound: false,
+        bindingStatus: "stale_missing_doc",
+        binding: null,
+        deletedBinding: {
+          ...deletedSurface,
+          projectId: project.id,
+          title: "Deleted Tab",
+          url: "https://docs.google.com/document/d/deleted-doc/edit",
+          status: "stale_missing_doc",
+          staleReason: "404"
+        }
+      }
+    ]
+  });
+
+  await exports.aceChooseProject(project.id);
+
+  let state = exports.aceTestState();
+  assert.equal(state.state, "deleted-binding-rebind-confirm");
+  assert.match(
+    state.widgetHtml,
+    /This project was bound to a now-deleted file\. Update this project to your current tab\?/
+  );
+  assert.match(state.widgetHtml, />Yes</);
+  assert.match(state.widgetHtml, />No</);
+
+  await exports.aceConfirmDeletedBindingRebind();
+
+  state = exports.aceTestState();
+  const putCall = backend.calls.find((call) => call.options?.method === "PUT");
+  const payload = JSON.parse(putCall.options.body);
+  assert.equal(payload.documentId, "new-doc");
+  assert.equal(payload.manuscriptSurfaceId, "new-doc:tab-b");
+  assert.equal(storage.aceDocumentBaselines[currentSurface.manuscriptSurfaceId].endDocumentWordCount, 397);
+  assert.equal(state.state, "prompt");
+  assert.equal(state.catchUpCandidate, null);
+  assert.doesNotMatch(state.widgetHtml, /Catch-up/);
+});
+
+test("declining deleted binding rebind leaves project unbound without baseline", async () => {
+  const deletedSurface = surfaceFactory({ documentId: "deleted-doc", tabId: "tab-a" });
+  const currentSurface = surfaceFactory({ documentId: "new-doc", tabId: "tab-b" });
+  const project = projectFactory({ id: "project-no-rebind", bookTitle: "No Rebind" });
+  const backend = createBackendMock({
+    "PUT /api/extension/document-binding": { project }
+  });
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    visibleWordCount: 397,
+    location: locationForSurface(currentSurface),
+    sendMessage: backend.sendMessage
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  exports.aceSetTestState({
+    state: "project-picker",
+    projectPickerMode: "bind",
+    currentSurface,
+    projects: [
+      {
+        project,
+        isBound: false,
+        bindingStatus: "stale_missing_doc",
+        deletedBinding: {
+          ...deletedSurface,
+          projectId: project.id,
+          status: "stale_missing_doc"
+        }
+      }
+    ]
+  });
+
+  await exports.aceChooseProject(project.id);
+  exports.aceCancelDeletedBindingRebind();
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "project-picker");
+  assert.equal(storage.aceDocumentBaselines?.[currentSurface.manuscriptSurfaceId], undefined);
+  assert.equal(backend.calls.some((call) => call.options?.method === "PUT"), false);
+  assert.equal(state.catchUpCandidate, null);
+});
+
 test("old documentId-only binding fallback applies only to default tab", async () => {
   const { exports, storage } = loadContent();
   storage.aceDocumentBindings = {
@@ -294,7 +398,7 @@ test("old documentId-only binding fallback applies only to default tab", async (
 });
 
 test("catch-up contract covers positive negative full deletion zero and missing counts", () => {
-  const { exports } = loadContent();
+  const { exports } = loadContent({ topFrame: true });
 
   assert.equal(evaluateCatchUp(exports, {
     baseline: baselineFactory(1000),
@@ -359,9 +463,11 @@ test("manual session start shows positive catch-up before starting", async () =>
   assert.equal(state.state, "catch-up");
   assert.equal(state.activeSession, null);
   assert.equal(state.catchUpCandidate.netWordsChanged, 500);
+  assert.match(state.widgetHtml, /Net: \+500 words since last session\./);
+  assert.match(state.widgetHtml, /Detected change: .*>\+500 words</);
 });
 
-test("page load evaluates catch-up for existing bound surface", async () => {
+test("page load does not show catch-up for existing bound surface", async () => {
   const surface = surfaceFactory({ documentId: "doc-page-load", tabId: "tab-a", tabTitle: "Tab A" });
   const project = projectFactory({ id: "project-page-load", bookTitle: "Page Load Project" });
   const { exports } = loadContent({
@@ -390,11 +496,11 @@ test("page load evaluates catch-up for existing bound surface", async () => {
   await new Promise((resolve) => setTimeout(resolve, 900));
 
   const state = exports.aceTestState();
-  assert.equal(state.state, "catch-up");
-  assert.equal(state.catchUpCandidate.netWordsChanged, 500);
+  assert.notEqual(state.state, "catch-up");
+  assert.equal(state.catchUpCandidate, null);
 });
 
-test("auto-start is blocked by required negative catch-up", async () => {
+test("auto-start activity does not show catch-up while writing", async () => {
   const surface = surfaceFactory({ documentId: "doc-delete", tabId: "tab-a", tabTitle: "Tab A" });
   const project = projectFactory({ id: "project-delete", bookTitle: "Delete Project" });
   const { exports } = loadContent({
@@ -434,9 +540,81 @@ test("auto-start is blocked by required negative catch-up", async () => {
   await exports.aceAutoStartBoundSessionFromActivity();
 
   const state = exports.aceTestState();
-  assert.equal(state.state, "catch-up");
+  assert.notEqual(state.state, "catch-up");
   assert.equal(state.activeSession, null);
-  assert.equal(state.catchUpCandidate.netWordsChanged, -2300);
+  assert.equal(state.catchUpCandidate, null);
+});
+
+test("typing suppression blocks ambient catch-up but explicit start still reconciles", () => {
+  const surface = surfaceFactory({ documentId: "doc-typing", tabId: "tab-a", tabTitle: "Tab A" });
+  const project = projectFactory({ id: "project-typing", bookTitle: "Typing Project" });
+  const { exports } = loadContent({ topFrame: true });
+
+  exports.aceRegisterWritingActivity();
+  assert.equal(exports.aceIsTypingSuppressionActive(), true);
+
+  const ambient = exports.aceEvaluateCatchUpCandidate({
+    trigger: "auto-start-attempt",
+    surface,
+    baseline: baselineFactory(100, { ...surface, project }),
+    baselineKey: surface.manuscriptSurfaceId,
+    currentSnapshot: snapshotFactory(600),
+    binding: bindingFactory({ ...surface, project }),
+    promptSuppressionReason: "typing-suppressed"
+  });
+  const explicit = exports.aceEvaluateCatchUpCandidate({
+    trigger: "pre-session",
+    surface,
+    baseline: baselineFactory(100, { ...surface, project }),
+    baselineKey: surface.manuscriptSurfaceId,
+    currentSnapshot: snapshotFactory(600),
+    binding: bindingFactory({ ...surface, project })
+  });
+
+  assert.equal(ambient.candidate, null);
+  assert.equal(ambient.reason, "typing-suppressed");
+  assert.equal(explicit.candidate.netWordsChanged, 500);
+});
+
+test("manual sync shows catch-up reconciliation on demand", async () => {
+  const surface = surfaceFactory({ documentId: "doc-manual-sync", tabId: "tab-a", tabTitle: "Tab A" });
+  const project = projectFactory({ id: "project-manual-sync", bookTitle: "Manual Sync Project" });
+  const { exports } = loadContent({
+    topFrame: true,
+    visibleWordCount: 600,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceDocumentBindings: {
+        [surface.manuscriptSurfaceId]: bindingFactory({ ...surface, project })
+      },
+      aceDocumentBaselines: {
+        [surface.manuscriptSurfaceId]: baselineFactory(100, { ...surface, project })
+      }
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({ ok: true, status: 200, wordCount: 600, revisionId: "manual" });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        callback({ ok: true, payload: { project } });
+      }
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  exports.aceSetTestState({
+    state: "prompt",
+    currentSurface: surface,
+    currentBinding: bindingFactory({ ...surface, project }),
+    selectedProject: project
+  });
+
+  await exports.aceManualSyncDocumentChanges();
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "catch-up");
+  assert.equal(state.catchUpCandidate.netWordsChanged, 500);
+  assert.match(state.widgetHtml, /Net: \+500 words since last session/);
 });
 
 test("catch-up handled before session keeps tracked session net separate", async () => {
@@ -461,7 +639,8 @@ test("catch-up handled before session keeps tracked session net separate", async
         return;
       }
       if (message.aceType === "ace-api-fetch") {
-        callback({ ok: true, payload: { project } });
+        const method = message.options?.method || "GET";
+        callback({ ok: true, payload: { project: method === "PUT" ? project : null } });
       }
     }
   });
@@ -520,7 +699,7 @@ test("logged full-deletion catch-up advances baseline and cannot repeat", async 
   assert.equal(next.reason, "zero-net");
 });
 
-test("binding an existing text tab initializes baseline to current count", async () => {
+test("initial bind with existing text shows catch-up before baseline advances", async () => {
   const surface = surfaceFactory({ documentId: "doc-bind-text", tabId: "tab-a", tabTitle: "Tab A" });
   const project = projectFactory({ id: "project-bind-text", bookTitle: "Bind Text" });
   const { exports, storage } = loadContent({
@@ -533,7 +712,8 @@ test("binding an existing text tab initializes baseline to current count", async
         return;
       }
       if (message.aceType === "ace-api-fetch") {
-        callback({ ok: true, payload: { project } });
+        const method = message.options?.method || "GET";
+        callback({ ok: true, payload: { project: method === "PUT" ? project : null } });
       }
     }
   });
@@ -546,7 +726,51 @@ test("binding an existing text tab initializes baseline to current count", async
 
   await exports.aceBindCurrentSurfaceToProject(project.id);
 
+  let state = exports.aceTestState();
+  assert.equal(state.state, "catch-up");
+  assert.equal(state.catchUpCandidate.startDocumentWordCount, 0);
+  assert.equal(state.catchUpCandidate.endDocumentWordCount, 500);
+  assert.equal(state.catchUpCandidate.netWordsChanged, 500);
+  assert.equal(storage.aceDocumentBaselines?.[surface.manuscriptSurfaceId], undefined);
+
+  await exports.aceSaveSkippedCatchUpBaseline(state.catchUpCandidate);
   assert.equal(storage.aceDocumentBaselines[surface.manuscriptSurfaceId].endDocumentWordCount, 500);
+});
+
+test("initial bind reconciles existing baseline delta during bind flow", async () => {
+  const surface = surfaceFactory({ documentId: "doc-bind-refresh", tabId: "tab-a", tabTitle: "Tab A" });
+  const project = projectFactory({ id: "project-bind-refresh", bookTitle: "Bind Refresh" });
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    visibleWordCount: 397,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceDocumentBaselines: {
+        [surface.manuscriptSurfaceId]: baselineFactory(0, { ...surface, project })
+      }
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-api-fetch") {
+        const method = message.options?.method || "GET";
+        callback({ ok: true, payload: { project: method === "PUT" ? project : null } });
+      }
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  exports.aceSetTestState({
+    state: "project-picker",
+    currentSurface: surface,
+    projects: [project]
+  });
+
+  await exports.aceBindCurrentSurfaceToProject(project.id);
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "catch-up");
+  assert.equal(state.catchUpCandidate.startDocumentWordCount, 0);
+  assert.equal(state.catchUpCandidate.endDocumentWordCount, 397);
+  assert.equal(state.catchUpCandidate.netWordsChanged, 397);
+  assert.match(state.widgetHtml, /Net: \+397 words since last session/);
 });
 
 test("binding an empty tab initializes a zero baseline", async () => {
@@ -673,16 +897,17 @@ test("active session blocks on tab switch and resumes only on original tab", asy
   const tabB = surfaceFactory({ documentId: "doc-1", tabId: "tab-b", tabTitle: "Tab B" });
   const { exports, context } = loadContent({
     topFrame: true,
-    initialStorage: {
-      aceActiveSession: sessionFactory({
-        ...tabA,
-        startedAt: new Date(Date.now() - 30000).toISOString()
-      })
-    },
     location: locationForSurface(tabA)
   });
   await new Promise((resolve) => setImmediate(resolve));
   await exports.aceHandleSurfaceLifecycleChange("qa-init");
+  exports.aceSetTestState({
+    state: "active",
+    activeSession: sessionFactory({
+      ...tabA,
+      startedAt: new Date(Date.now() - 30000).toISOString()
+    })
+  });
 
   context.location.hash = locationForSurface(tabB).hash;
   context.location.href = locationForSurface(tabB).href;
@@ -693,4 +918,400 @@ test("active session blocks on tab switch and resumes only on original tab", asy
   context.location.href = locationForSurface(tabA).href;
   await exports.aceHandleSurfaceLifecycleChange("qa-return");
   assert.equal(exports.aceTestState().state, "active");
+});
+
+test("same document and same Chrome tab can complete a negative writing session", async () => {
+  const surface = surfaceFactory({ documentId: "doc-negative", tabId: "tab-a", tabTitle: "Draft" });
+  const project = projectFactory({ id: "project-negative", bookTitle: "Negative Project" });
+  const calls = [];
+  const { exports } = loadContent({
+    topFrame: true,
+    chromeTabId: 101,
+    visibleWordCount: 60000,
+    location: locationForSurface(surface),
+    sendMessage(message, callback) {
+      calls.push(message);
+      if (message.aceType === "ace-google-doc-net-count") {
+        callback({
+          ok: true,
+          status: 200,
+          wordCount: 60000,
+          netWordsChanged: -500,
+          revisionId: "end-revision",
+          wordCountMethod: "google-docs-api"
+        });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        callback({ ok: true, payload: { project, session: { netWordsChanged: -500 } } });
+        return;
+      }
+      callback({ ok: false, wordCount: null, error: "unexpected message" });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const sessionScope = exports.aceCreateSessionScope(surface, {
+    projectId: project.id,
+    chromeTabId: "101"
+  });
+  exports.aceSetTestState({
+    state: "active",
+    activeSession: sessionFactory({
+      ...surface,
+      project,
+      projectId: project.id,
+      extensionSessionId: "session-negative",
+      sessionType: "writing",
+      startedAt: new Date(Date.now() - 60000).toISOString(),
+      endedAt: "",
+      startDocumentWordCount: 60500,
+      endDocumentWordCount: null,
+      sessionScope,
+      chromeTabId: "101"
+    })
+  });
+
+  await exports.aceEndSession();
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "completed");
+  assert.equal(state.completedSession.netWordsChanged, -500);
+  assert.equal(state.completedSession.endDocumentWordCount, 60000);
+  assert.equal(state.activeSession, null);
+  assert.equal(calls.some((message) => message.aceType === "ace-google-doc-net-count"), true);
+});
+
+test("different Google document blocks session completion before word count", async () => {
+  const docA = surfaceFactory({ documentId: "doc-a", tabId: "tab-a", tabTitle: "Doc A" });
+  const docB = surfaceFactory({ documentId: "doc-b", tabId: "tab-b", tabTitle: "Doc B" });
+  const project = projectFactory({ id: "project-scope", bookTitle: "Scoped Project" });
+  const calls = [];
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    chromeTabId: 202,
+    visibleWordCount: 500,
+    location: locationForSurface(docB),
+    sendMessage(message, callback) {
+      calls.push(message);
+      callback({ ok: false, wordCount: null, error: "wrong scope should not measure" });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const activeSession = sessionFactory({
+    ...docA,
+    project,
+    projectId: project.id,
+    extensionSessionId: "session-doc-a",
+    sessionType: "writing",
+    startedAt: new Date(Date.now() - 60000).toISOString(),
+    endedAt: "",
+    startDocumentWordCount: 60500,
+    endDocumentWordCount: null,
+    sessionScope: exports.aceCreateSessionScope(docA, {
+      projectId: project.id,
+      chromeTabId: "101"
+    }),
+    chromeTabId: "101"
+  });
+  exports.aceSetTestState({
+    state: "active",
+    activeSession
+  });
+
+  const callsBeforeEnd = calls.length;
+  await exports.aceEndSession();
+  const completionCalls = calls.slice(callsBeforeEnd);
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "tab-blocked");
+  assert.equal(state.activeSession.extensionSessionId, "session-doc-a");
+  assert.equal(state.completedSession, null);
+  assert.equal(storage.acePendingSessions, undefined);
+  assert.equal(completionCalls.some((message) => message.aceType === "ace-google-doc-net-count"), false);
+  assert.equal(completionCalls.some((message) => message.aceType === "ace-api-fetch"), false);
+  assert.match(state.widgetHtml, /belongs to another Google Docs tab|Return to/);
+});
+
+test("same Google document in a different Chrome tab cannot complete the session", async () => {
+  const surface = surfaceFactory({ documentId: "doc-shared", tabId: "tab-a", tabTitle: "Shared Doc" });
+  const project = projectFactory({ id: "project-shared", bookTitle: "Shared Project" });
+  const calls = [];
+  const { exports } = loadContent({
+    topFrame: true,
+    chromeTabId: 303,
+    visibleWordCount: 0,
+    location: locationForSurface(surface),
+    sendMessage(message, callback) {
+      calls.push(message);
+      callback({ ok: false, wordCount: null, error: "wrong Chrome tab should not measure" });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  exports.aceSetTestState({
+    state: "active",
+    activeSession: sessionFactory({
+      ...surface,
+      project,
+      projectId: project.id,
+      extensionSessionId: "session-shared",
+      startedAt: new Date(Date.now() - 60000).toISOString(),
+      endedAt: "",
+      startDocumentWordCount: 2300,
+      endDocumentWordCount: null,
+      sessionScope: exports.aceCreateSessionScope(surface, {
+        projectId: project.id,
+        chromeTabId: "101"
+      }),
+      chromeTabId: "101"
+    })
+  });
+
+  const callsBeforeEnd = calls.length;
+  await exports.aceEndSession();
+  const completionCalls = calls.slice(callsBeforeEnd);
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "tab-blocked");
+  assert.equal(state.completedSession, null);
+  assert.equal(completionCalls.some((message) => message.aceType === "ace-google-doc-net-count"), false);
+  assert.equal(completionCalls.some((message) => message.aceType === "ace-api-fetch"), false);
+});
+
+test("session scope validation reports document and Chrome tab mismatches", () => {
+  const surface = surfaceFactory({ documentId: "doc-scope", tabId: "tab-a", tabTitle: "Scope Tab" });
+  const project = projectFactory({ id: "project-scope-validation" });
+  const { exports } = loadContent({ location: locationForSurface(surface) });
+  const session = sessionFactory({
+    ...surface,
+    project,
+    projectId: project.id,
+    sessionScope: exports.aceCreateSessionScope(surface, {
+      projectId: project.id,
+      chromeTabId: "101"
+    }),
+    chromeTabId: "101"
+  });
+
+  const sameScope = exports.aceCreateSessionScope(surface, {
+    projectId: project.id,
+    chromeTabId: "101"
+  });
+  const otherDocScope = exports.aceCreateSessionScope(surfaceFactory({
+    documentId: "doc-other",
+    tabId: "tab-a",
+    tabTitle: "Other"
+  }), {
+    projectId: project.id,
+    chromeTabId: "101"
+  });
+  const otherChromeTabScope = exports.aceCreateSessionScope(surface, {
+    projectId: project.id,
+    chromeTabId: "202"
+  });
+
+  assert.equal(exports.aceValidateSessionScope(session, sameScope).ok, true);
+  assert.equal(exports.aceValidateSessionScope(session, otherDocScope).reason, "document-mismatch");
+  assert.equal(exports.aceValidateSessionScope(session, otherChromeTabScope).reason, "chrome-tab-mismatch");
+});
+
+test("reload with stored active session shows abandoned-session recovery modal", async () => {
+  const surface = surfaceFactory({ documentId: "doc-reload", tabId: "tab-a", tabTitle: "Reload Tab" });
+  const project = projectFactory({ id: "project-reload", bookTitle: "The Black Harbor" });
+  const activeSession = sessionFactory({
+    ...surface,
+    project,
+    projectId: project.id,
+    extensionSessionId: "session-reload",
+    startedAt: new Date(Date.now() - 43 * 60000).toISOString(),
+    endedAt: "",
+    startDocumentWordCount: 60000,
+    endDocumentWordCount: null
+  });
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    visibleWordCount: 60812,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceActiveSession: activeSession
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({ ok: true, status: 200, wordCount: 60812, revisionId: "recovery" });
+        return;
+      }
+      callback({ ok: true, payload: { project } });
+    }
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 900));
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "recovery");
+  assert.equal(state.activeSession, null);
+  assert.equal(state.recoveryCandidate.netWordsChanged, 812);
+  assert.equal(storage.aceAbandonedSessions[0].extensionSessionId, "session-reload");
+  assert.match(state.widgetHtml, /You closed your last session without saving\./);
+  assert.match(state.widgetHtml, /The Black Harbor/);
+  assert.match(state.widgetHtml, /Word change/);
+  assert.match(state.widgetHtml, /\+812 words/);
+  assert.match(state.widgetHtml, /Recover Session/);
+  assert.match(state.widgetHtml, /Discard/);
+});
+
+test("recovering abandoned session syncs once and advances baseline", async () => {
+  const surface = surfaceFactory({ documentId: "doc-recover", tabId: "tab-a", tabTitle: "Recover Tab" });
+  const project = projectFactory({ id: "project-recover", bookTitle: "Recover Project" });
+  const abandonedSession = sessionFactory({
+    ...surface,
+    project,
+    projectId: project.id,
+    extensionSessionId: "session-recover",
+    startedAt: new Date(Date.now() - 20 * 60000).toISOString(),
+    endedAt: "",
+    startDocumentWordCount: 60000,
+    endDocumentWordCount: null
+  });
+  const calls = [];
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    visibleWordCount: 60800,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceActiveSession: abandonedSession
+    },
+    sendMessage(message, callback) {
+      calls.push(message);
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({ ok: true, status: 200, wordCount: 60800, revisionId: "recover-end" });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        callback({
+          ok: true,
+          payload: {
+            project,
+            session: {
+              extensionSessionId: "session-recover",
+              netWordsChanged: 800
+            }
+          }
+        });
+      }
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 900));
+
+  await exports.aceRecoverAbandonedSession();
+
+  const postCalls = calls.filter((message) => (
+    message.aceType === "ace-api-fetch"
+    && message.path === "/api/extension/sessions"
+    && message.options?.method === "POST"
+  ));
+  const payload = JSON.parse(postCalls[0].options.body);
+  assert.equal(postCalls.length, 1);
+  assert.equal(payload.extensionSessionId, "session-recover");
+  assert.equal(payload.startDocumentWordCount, 60000);
+  assert.equal(payload.endDocumentWordCount, 60800);
+  assert.equal(payload.netWordsChanged, 800);
+  assert.equal(storage.aceAbandonedSessions.length, 0);
+  assert.equal(storage.aceActiveSession, undefined);
+  assert.equal(storage.aceDocumentBaselines[surface.manuscriptSurfaceId].endDocumentWordCount, 60800);
+});
+
+test("discarding abandoned session does not advance baseline and catch-up remains possible", async () => {
+  const surface = surfaceFactory({ documentId: "doc-discard", tabId: "tab-a", tabTitle: "Discard Tab" });
+  const project = projectFactory({ id: "project-discard", bookTitle: "Discard Project" });
+  const activeSession = sessionFactory({
+    ...surface,
+    project,
+    projectId: project.id,
+    extensionSessionId: "session-discard",
+    startedAt: new Date(Date.now() - 10 * 60000).toISOString(),
+    endedAt: "",
+    startDocumentWordCount: 60000,
+    endDocumentWordCount: null
+  });
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    visibleWordCount: 60800,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceActiveSession: activeSession,
+      aceDocumentBindings: {
+        [surface.manuscriptSurfaceId]: bindingFactory({ ...surface, project })
+      },
+      aceDocumentBaselines: {
+        [surface.manuscriptSurfaceId]: baselineFactory(60000, { ...surface, project })
+      }
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({ ok: true, status: 200, wordCount: 60800, revisionId: "discard-current" });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        callback({ ok: true, payload: { project } });
+      }
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 900));
+
+  await exports.aceDiscardAbandonedSession();
+
+  assert.equal(storage.aceAbandonedSessions.length, 0);
+  assert.equal(storage.aceActiveSession, undefined);
+  assert.equal(storage.aceDocumentBaselines[surface.manuscriptSurfaceId].endDocumentWordCount, 60000);
+
+  const catchUpResult = await exports.aceBuildCatchUpCandidate(surface.documentId, "pre-session");
+  assert.equal(catchUpResult.candidate.netWordsChanged, 800);
+  assert.equal(catchUpResult.candidate.startDocumentWordCount, 60000);
+  assert.equal(catchUpResult.candidate.endDocumentWordCount, 60800);
+});
+
+test("pending session suppresses duplicate abandoned-session recovery", async () => {
+  const surface = surfaceFactory({ documentId: "doc-duplicate", tabId: "tab-a", tabTitle: "Duplicate Tab" });
+  const project = projectFactory({ id: "project-duplicate", bookTitle: "Duplicate Project" });
+  const activeSession = sessionFactory({
+    ...surface,
+    project,
+    projectId: project.id,
+    extensionSessionId: "session-duplicate",
+    startedAt: new Date(Date.now() - 10 * 60000).toISOString(),
+    endedAt: "",
+    startDocumentWordCount: 1000,
+    endDocumentWordCount: null
+  });
+  const pendingSession = pendingSessionFactory({
+    ...surface,
+    project,
+    projectId: project.id,
+    extensionSessionId: "session-duplicate",
+    startDocumentWordCount: 1000,
+    endDocumentWordCount: 1200,
+    netWordsChanged: 200
+  });
+  const { exports } = loadContent({
+    topFrame: true,
+    visibleWordCount: 1200,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceActiveSession: activeSession,
+      acePendingSessions: [pendingSession],
+      aceAbandonedSessions: [activeSession]
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({ ok: true, status: 200, wordCount: 1200, revisionId: "duplicate" });
+        return;
+      }
+      callback({ ok: true, payload: { project } });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "completed");
+  assert.equal(state.recoveryCandidate, null);
+  assert.equal(state.completedSession.extensionSessionId, "session-duplicate");
 });

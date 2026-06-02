@@ -114,6 +114,14 @@ test("manuscript surface id helpers normalize tab identity", () => {
   assert.equal(exports.aceNormalizeTabTitle("  Draft   V2  "), "Draft V2");
 });
 
+test("catch-up net delta is current count minus previous baseline", () => {
+  const { exports } = loadContent();
+
+  assert.equal(exports.aceCalculateNetWordDelta(0, 397), 397);
+  assert.equal(exports.aceCalculateNetWordDelta(397, 0), -397);
+  assert.equal(exports.aceCalculateNetWordDelta(397, 397), 0);
+});
+
 test("current manuscript surface falls back to default tab when unavailable", () => {
   const { exports } = loadContent();
   const surface = exports.aceCurrentManuscriptSurface("doc123");
@@ -765,7 +773,6 @@ test("active session blocks on tab switch and resumes on original tab", async ()
   });
   const { exports, context } = loadContent({
     topFrame: true,
-    initialStorage: { aceActiveSession: activeSession },
     location: {
       href: "https://docs.google.com/document/d/doc-test/edit#tab=tabA&tabTitle=Tab%20A",
       hash: "#tab=tabA&tabTitle=Tab%20A"
@@ -773,6 +780,10 @@ test("active session blocks on tab switch and resumes on original tab", async ()
   });
   await new Promise((resolve) => setImmediate(resolve));
   await exports.aceHandleSurfaceLifecycleChange("test-init");
+  exports.aceSetTestState({
+    state: "active",
+    activeSession
+  });
 
   context.location.hash = "#tab=tabB&tabTitle=Tab%20B";
   context.location.href = "https://docs.google.com/document/d/doc-test/edit#tab=tabB&tabTitle=Tab%20B";
@@ -804,7 +815,6 @@ test("tab title rename keeps surface id and updates active session metadata", as
   });
   const { exports, context } = loadContent({
     topFrame: true,
-    initialStorage: { aceActiveSession: activeSession },
     location: {
       href: "https://docs.google.com/document/d/doc-test/edit#tab=tabA&tabTitle=Old%20Title",
       hash: "#tab=tabA&tabTitle=Old%20Title"
@@ -812,6 +822,10 @@ test("tab title rename keeps surface id and updates active session metadata", as
   });
   await new Promise((resolve) => setImmediate(resolve));
   await exports.aceHandleSurfaceLifecycleChange("test-init");
+  exports.aceSetTestState({
+    state: "active",
+    activeSession
+  });
 
   context.location.hash = "#tab=tabA&tabTitle=New%20Title";
   context.location.href = "https://docs.google.com/document/d/doc-test/edit#tab=tabA&tabTitle=New%20Title";

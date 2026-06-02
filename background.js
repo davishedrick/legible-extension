@@ -6,6 +6,7 @@
   const ACE_GOOGLE_DOC_WORD_COUNT_MESSAGE = "ace-google-doc-word-count";
   const ACE_GOOGLE_DOC_START_SNAPSHOT_MESSAGE = "ace-google-doc-start-snapshot";
   const ACE_GOOGLE_DOC_NET_COUNT_MESSAGE = "ace-google-doc-net-count";
+  const ACE_CURRENT_TAB_SCOPE_MESSAGE = "ace-current-tab-scope";
   const ACE_GOOGLE_DOCS_SCOPE = "https://www.googleapis.com/auth/documents.readonly";
   const ACE_WORD_SNAPSHOT_STORAGE_PREFIX = "aceWordSnapshot:";
   const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v3";
@@ -13,8 +14,17 @@
   const ACE_SCRIPTOR_SESSION_COOKIE = "session";
   const ACE_SCRIPTOR_SESSION_HEADER = "X-Scriptor-Session";
 
-  chrome.runtime.onMessage.addListener(function (message, _sender, sendResponse) {
+  chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
     if (!message) {
+      return false;
+    }
+
+    if (message.aceType === ACE_CURRENT_TAB_SCOPE_MESSAGE) {
+      sendResponse({
+        ok: true,
+        chromeTabId: sender?.tab?.id ?? null,
+        frameId: sender?.frameId ?? null
+      });
       return false;
     }
 
@@ -277,6 +287,17 @@
         wordCount: null,
         netWordsChanged: 0,
         error: "E-START-COUNT-MISSING: No start word count exists for this session. Reload the Google Doc after choosing a project, then start a new session."
+      };
+    }
+    const requestedTabId = String(message.tabId || "").trim();
+    const snapshotTabId = String(startSnapshot.tabId || "").trim();
+    if (snapshotTabId && requestedTabId && snapshotTabId !== requestedTabId) {
+      return {
+        ok: false,
+        status: 409,
+        wordCount: null,
+        netWordsChanged: 0,
+        error: `E-START-SCOPE-MISMATCH: Session started on tab ${snapshotTabId} but completion requested tab ${requestedTabId}.`
       };
     }
 
