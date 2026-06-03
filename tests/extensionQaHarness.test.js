@@ -1,6 +1,6 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { loadContent } = require("./helpers");
+const { loadBackground, loadContent } = require("./helpers");
 const {
   baselineFactory,
   bindingFactory,
@@ -64,6 +64,102 @@ test("QA harness factories build consistent manuscript surfaces", () => {
   assert.equal(baseline.endDocumentWordCount, 777);
   assert.equal(session.netWordsChanged, 77);
   assert.equal(issue.tabTitle, "Chapter 7");
+});
+
+test("background app bridge forwards Scriptor session cookie as extension auth header", async () => {
+  const { exports, fetchCalls } = loadBackground([], {
+    sessionCookie: "signed-session-cookie",
+    defaultFetchPayload: { projects: [] }
+  });
+
+  const response = await exports.aceFetchFromApp({
+    path: "/api/extension/projects",
+    options: { method: "GET" }
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(fetchCalls[0].options.credentials, "include");
+  assert.equal(fetchCalls[0].options.headers["X-Scriptor-Session"], "signed-session-cookie");
+});
+
+test("background app bridge falls back to domain cookie lookup when URL lookup misses", async () => {
+  const { exports, fetchCalls } = loadBackground([], {
+    sessionCookies: [{ domain: "davishedrick.pythonanywhere.com", value: "domain-session-cookie" }],
+    defaultFetchPayload: { projects: [] }
+  });
+
+  const response = await exports.aceFetchFromApp({
+    path: "/api/extension/projects",
+    options: { method: "GET" }
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(fetchCalls[0].options.headers["X-Scriptor-Session"], "domain-session-cookie");
+});
+
+test("project fetch recovers when runtime bridge auth misses but direct app session works", async () => {
+  const project = projectFactory({ id: "project-auth", bookTitle: "Auth Project" });
+  const { exports, fetchCalls } = loadContent({
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-api-fetch" && message.path === "/api/extension/projects") {
+        callback({
+          ok: false,
+          status: 401,
+          payload: { error: "Authentication required." },
+          error: "Authentication required."
+        });
+        return;
+      }
+      callback({ ok: false, error: "Unexpected message." });
+    },
+    fetch: async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ projects: [project] })
+    })
+  });
+
+  const projects = await exports.aceGetExtensionProjects();
+
+  assert.equal(projects.length, 1);
+  assert.equal(projects[0].id, "project-auth");
+  assert.equal(fetchCalls[0].url, "https://davishedrick.pythonanywhere.com/api/extension/projects");
+  assert.equal(fetchCalls[0].options.credentials, "include");
+});
+
+test("background can focus owning Chrome tab and request session end", async () => {
+  const tabMessages = [];
+  const tab = { id: 101, windowId: 7, active: false };
+  const windowRecord = { id: 7, focused: false };
+  const { exports } = loadBackground([], {
+    tabs: { 101: tab },
+    windows: { 7: windowRecord },
+    sendTabMessage(tabId, message, callback) {
+      tabMessages.push({ tabId, message });
+      callback({ ok: true });
+    }
+  });
+
+  const response = await exports.aceEndSessionInChromeTab({
+    chromeTabId: "101",
+    extensionSessionId: "session-a"
+  });
+
+  assert.equal(response.ok, true);
+  assert.equal(tab.active, true);
+  assert.equal(windowRecord.focused, true);
+  assert.equal(tabMessages[0].tabId, 101);
+  assert.equal(tabMessages[0].message.aceType, "ace-end-active-session");
+  assert.equal(tabMessages[0].message.extensionSessionId, "session-a");
+});
+
+test("background reports missing owning Chrome tab instead of silently failing", async () => {
+  const { exports } = loadBackground([], { tabs: {} });
+
+  await assert.rejects(
+    () => exports.aceFocusChromeTab({ chromeTabId: "404" }),
+    /Original writing tab is no longer available/
+  );
 });
 
 test("one manuscript tab stores only one local project binding", async () => {
@@ -699,14 +795,16 @@ test("logged full-deletion catch-up advances baseline and cannot repeat", async 
   assert.equal(next.reason, "zero-net");
 });
 
-test("initial bind with existing text shows catch-up before baseline advances", async () => {
+test("initial bind with existing text establishes baseline without catch-up", async () => {
   const surface = surfaceFactory({ documentId: "doc-bind-text", tabId: "tab-a", tabTitle: "Tab A" });
   const project = projectFactory({ id: "project-bind-text", bookTitle: "Bind Text" });
+  const calls = [];
   const { exports, storage } = loadContent({
     topFrame: true,
     visibleWordCount: 500,
     location: locationForSurface(surface),
     sendMessage(message, callback) {
+      calls.push(message);
       if (message.aceType === "ace-google-doc-word-count") {
         callback({ ok: true, status: 200, wordCount: 500, revisionId: "five-hundred" });
         return;
@@ -727,17 +825,64 @@ test("initial bind with existing text shows catch-up before baseline advances", 
   await exports.aceBindCurrentSurfaceToProject(project.id);
 
   let state = exports.aceTestState();
-  assert.equal(state.state, "catch-up");
-  assert.equal(state.catchUpCandidate.startDocumentWordCount, 0);
-  assert.equal(state.catchUpCandidate.endDocumentWordCount, 500);
-  assert.equal(state.catchUpCandidate.netWordsChanged, 500);
-  assert.equal(storage.aceDocumentBaselines?.[surface.manuscriptSurfaceId], undefined);
-
-  await exports.aceSaveSkippedCatchUpBaseline(state.catchUpCandidate);
+  assert.equal(state.state, "prompt");
+  assert.equal(state.catchUpCandidate, null);
   assert.equal(storage.aceDocumentBaselines[surface.manuscriptSurfaceId].endDocumentWordCount, 500);
+  assert.match(state.widgetHtml, /Verified manuscript size: 500 words/);
+  const bindingCall = calls.find((message) => (
+    message.aceType === "ace-api-fetch"
+    && message.path === "/api/extension/document-binding"
+    && message.options?.method === "PUT"
+  ));
+  const bindingPayload = JSON.parse(bindingCall.options.body);
+  assert.equal(bindingPayload.verifiedWordCount, 500);
 });
 
-test("initial bind reconciles existing baseline delta during bind flow", async () => {
+test("initial bind does not trust false visible zero when API sees document words", async () => {
+  const surface = surfaceFactory({ documentId: "doc-bind-visible-zero", tabId: "tab-a", tabTitle: "Tab A" });
+  const project = projectFactory({ id: "project-bind-zero-api", bookTitle: "Bind Zero API" });
+  const calls = [];
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    visibleWordCount: 0,
+    location: locationForSurface(surface),
+    sendMessage(message, callback) {
+      calls.push(message);
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({ ok: true, status: 200, wordCount: 522, revisionId: "api-522" });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        const method = message.options?.method || "GET";
+        callback({ ok: true, payload: { project: method === "PUT" ? project : null } });
+      }
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  exports.aceSetTestState({
+    state: "project-picker",
+    currentSurface: surface,
+    projects: [project]
+  });
+
+  await exports.aceBindCurrentSurfaceToProject(project.id);
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "prompt");
+  assert.equal(state.catchUpCandidate, null);
+  assert.equal(storage.aceDocumentBaselines[surface.manuscriptSurfaceId].endDocumentWordCount, 522);
+  assert.match(state.widgetHtml, /Verified manuscript size: 522 words/);
+  assert.doesNotMatch(state.widgetHtml, /Verified manuscript size: 0 words/);
+  const bindingCall = calls.find((message) => (
+    message.aceType === "ace-api-fetch"
+    && message.path === "/api/extension/document-binding"
+    && message.options?.method === "PUT"
+  ));
+  const bindingPayload = JSON.parse(bindingCall.options.body);
+  assert.equal(bindingPayload.verifiedWordCount, 522);
+});
+
+test("initial bind with stale local zero baseline resets to verified document count", async () => {
   const surface = surfaceFactory({ documentId: "doc-bind-refresh", tabId: "tab-a", tabTitle: "Tab A" });
   const project = projectFactory({ id: "project-bind-refresh", bookTitle: "Bind Refresh" });
   const { exports, storage } = loadContent({
@@ -766,11 +911,10 @@ test("initial bind reconciles existing baseline delta during bind flow", async (
   await exports.aceBindCurrentSurfaceToProject(project.id);
 
   const state = exports.aceTestState();
-  assert.equal(state.state, "catch-up");
-  assert.equal(state.catchUpCandidate.startDocumentWordCount, 0);
-  assert.equal(state.catchUpCandidate.endDocumentWordCount, 397);
-  assert.equal(state.catchUpCandidate.netWordsChanged, 397);
-  assert.match(state.widgetHtml, /Net: \+397 words since last session/);
+  assert.equal(state.state, "prompt");
+  assert.equal(state.catchUpCandidate, null);
+  assert.equal(storage.aceDocumentBaselines[surface.manuscriptSurfaceId].endDocumentWordCount, 397);
+  assert.match(state.widgetHtml, /Verified manuscript size: 397 words/);
 });
 
 test("binding an empty tab initializes a zero baseline", async () => {

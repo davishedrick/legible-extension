@@ -33,6 +33,7 @@ function loadBackground(fixtures = [], options = {}) {
   const context = {
     console,
     __ACE_TEST_EXPORTS__: exports,
+    URL,
     URLSearchParams,
     fetch: async (url, fetchOptions = {}) => {
       fetchUrls.push(String(url));
@@ -85,6 +86,40 @@ function loadBackground(fixtures = [], options = {}) {
       cookies: {
         get(_details, callback) {
           callback(options.sessionCookie ? { value: options.sessionCookie } : null);
+        },
+        getAll(_details, callback) {
+          callback(options.sessionCookies || []);
+        }
+      },
+      tabs: {
+        get(tabId, callback) {
+          const tab = options.tabs?.[String(tabId)] || null;
+          context.chrome.runtime.lastError = tab ? null : { message: "No tab with id." };
+          callback(tab);
+          context.chrome.runtime.lastError = null;
+        },
+        update(tabId, updateProperties, callback) {
+          const tab = options.tabs?.[String(tabId)] || null;
+          context.chrome.runtime.lastError = tab ? null : { message: "No tab with id." };
+          if (tab) {
+            Object.assign(tab, updateProperties);
+          }
+          callback(tab);
+          context.chrome.runtime.lastError = null;
+        },
+        sendMessage(tabId, message, callback) {
+          if (options.sendTabMessage) {
+            options.sendTabMessage(tabId, message, callback);
+            return;
+          }
+          callback({ ok: true });
+        }
+      },
+      windows: {
+        update(windowId, updateProperties, callback) {
+          const win = options.windows?.[String(windowId)] || { id: windowId };
+          Object.assign(win, updateProperties);
+          callback(win);
         }
       },
       storage: {
@@ -120,6 +155,7 @@ function loadBackground(fixtures = [], options = {}) {
 function loadContent(options = {}) {
   const storage = { ...(options.initialStorage || {}) };
   const exports = {};
+  const fetchCalls = [];
   const source = fs.readFileSync(path.resolve(__dirname, "..", "content.js"), "utf8");
   const visibleWordCountElement = options.visibleWordCount === undefined ? null : {
     textContent: `${Number(options.visibleWordCount) || 0} words`,
@@ -187,6 +223,13 @@ function loadContent(options = {}) {
     window,
     document,
     navigator: { clipboard: null },
+    fetch: async (url, fetchOptions = {}) => {
+      fetchCalls.push({ url: String(url), options: fetchOptions });
+      if (options.fetch) {
+        return options.fetch(url, fetchOptions);
+      }
+      throw new Error("No mocked direct fetch response queued.");
+    },
     sessionStorage: {
       getItem() { return null; },
       setItem() {}
@@ -194,6 +237,7 @@ function loadContent(options = {}) {
     chrome: {
       runtime: {
         lastError: null,
+        onMessage: { addListener() {} },
         sendMessage(message, callback) {
           if (message.aceType === "ace-current-tab-scope") {
             if (callback) {
@@ -249,7 +293,7 @@ function loadContent(options = {}) {
   };
   vm.createContext(context);
   vm.runInContext(source, context);
-  return { exports, storage, context };
+  return { exports, storage, context, fetchCalls };
 }
 
 module.exports = {

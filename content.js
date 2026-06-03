@@ -19,6 +19,8 @@
   const ACE_GOOGLE_DOC_START_SNAPSHOT_MESSAGE = "ace-google-doc-start-snapshot";
   const ACE_GOOGLE_DOC_NET_COUNT_MESSAGE = "ace-google-doc-net-count";
   const ACE_CURRENT_TAB_SCOPE_MESSAGE = "ace-current-tab-scope";
+  const ACE_FOCUS_CHROME_TAB_MESSAGE = "ace-focus-chrome-tab";
+  const ACE_END_SESSION_IN_TAB_MESSAGE = "ace-end-session-in-tab";
   const ACE_WORD_SNAPSHOT_STORAGE_PREFIX = "aceWordSnapshot:";
   const ACE_AUTO_START_UNBOUND_RECHECK_MS = 30000;
   const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v3";
@@ -404,6 +406,43 @@
     });
   }
 
+  function aceRuntimeRequest(message) {
+    return new Promise(function (resolve) {
+      const runtime = aceChromeRuntime();
+      if (!runtime?.runtime?.sendMessage) {
+        resolve({ ok: false, error: "Extension context is not available. Refresh the Google Doc." });
+        return;
+      }
+
+      try {
+        runtime.runtime.sendMessage(message, function (response) {
+          if (runtime.runtime.lastError) {
+            resolve({ ok: false, error: runtime.runtime.lastError.message || "Extension request failed." });
+            return;
+          }
+          resolve(response || {});
+        });
+      } catch (error) {
+        resolve({ ok: false, error: error.message || "Extension request failed." });
+      }
+    });
+  }
+
+  async function aceFocusChromeTab(chromeTabId) {
+    return aceRuntimeRequest({
+      aceType: ACE_FOCUS_CHROME_TAB_MESSAGE,
+      chromeTabId
+    });
+  }
+
+  async function aceRequestEndSessionInChromeTab(session) {
+    return aceRuntimeRequest({
+      aceType: ACE_END_SESSION_IN_TAB_MESSAGE,
+      chromeTabId: session?.chromeTabId || session?.sessionScope?.chromeTabId || "",
+      extensionSessionId: session?.extensionSessionId || ""
+    });
+  }
+
   async function aceGetCurrentDocumentScope(projectId = "") {
     const currentSurface = aceCurrentManuscriptSurface();
     const tabScope = await aceCurrentChromeTabScope();
@@ -713,6 +752,20 @@
       || message.includes("receiving end does not exist");
   }
 
+  function aceIsApiAuthFailure(response) {
+    const status = Number(response?.status) || 0;
+    if (status === 401 || status === 403) {
+      return true;
+    }
+
+    const message = String(response?.error || response?.payload?.error || "").toLowerCase();
+    return message.includes("authentication")
+      || message.includes("unauthorized")
+      || message.includes("forbidden")
+      || message.includes("sign in")
+      || message.includes("login");
+  }
+
   async function aceDirectApiFetch(path, options) {
     if (!path.startsWith("/api/")) {
       throw new Error("Invalid Scriptor API path.");
@@ -783,6 +836,26 @@
       throw error;
     }
     if (!response.ok) {
+      if (aceIsApiAuthFailure(response)) {
+        try {
+          const payload = await aceDirectApiFetch(path, options);
+          console.info("[ACE] APP API AUTH FALLBACK", {
+            path,
+            bridgeStatus: Number(response.status) || 0,
+            action: "direct-fetch-succeeded"
+          });
+          return payload;
+        } catch (directError) {
+          console.warn("[ACE] APP API AUTH FALLBACK", {
+            path,
+            bridgeStatus: Number(response.status) || 0,
+            action: "direct-fetch-failed",
+            bridgeError: response.error || "",
+            directError: directError?.message || String(directError)
+          });
+          throw directError;
+        }
+      }
       throw new Error(response.error || "Scriptor API request failed.");
     }
     return response.payload || {};
@@ -806,10 +879,12 @@
     return response?.project || null;
   }
 
-  async function aceSaveBinding(surfaceOrDocumentId, projectId) {
+  async function aceSaveBinding(surfaceOrDocumentId, projectId, options = {}) {
     const surface = typeof surfaceOrDocumentId === "object"
       ? aceSurfaceFromParts(surfaceOrDocumentId)
       : aceCurrentManuscriptSurface(surfaceOrDocumentId);
+    const verifiedWordCount = Number(options.verifiedWordCount);
+    const hasVerifiedWordCount = Number.isFinite(verifiedWordCount);
     return aceApiFetch("/api/extension/document-binding", {
       method: "PUT",
       body: JSON.stringify({
@@ -818,7 +893,11 @@
         tabTitle: surface.tabTitle,
         manuscriptSurfaceId: surface.manuscriptSurfaceId,
         documentUrl: aceDocumentUrl(surface.documentId),
-        projectId
+        projectId,
+        ...(hasVerifiedWordCount ? {
+          verifiedWordCount: Math.max(0, Math.round(verifiedWordCount)),
+          verifiedWordCountSource: options.verifiedWordCountSource || "google-docs-binding"
+        } : {})
       })
     });
   }
@@ -1463,6 +1542,47 @@
   async function aceRefreshDocumentBaselineFromCurrentCount(surfaceOrDocumentId, project) {
     await aceSaveGoogleDocBaseline(surfaceOrDocumentId, project);
     return aceGetDocumentBaseline(surfaceOrDocumentId);
+  }
+
+  async function aceVerifiedBindingSnapshot(surface) {
+    const baseline = {
+      ...surface,
+      endDocumentWordCount: 0,
+      wordCountMethod: "binding-initialization"
+    };
+    const snapshot = await aceGoogleDocWordCountAfterSettle(surface.documentId, baseline, {
+      trigger: "bind-baseline",
+      successAction: "baseline-initialized",
+      verifyZeroWithApi: true,
+      apiSurfaceTrusted: true
+    });
+    const wordCount = Number(snapshot?.wordCount);
+    if (!snapshot?.ok || !Number.isFinite(wordCount)) {
+      throw new Error("Could not verify the current Google Docs word count for this binding.");
+    }
+    return {
+      ...snapshot,
+      wordCount: Math.max(0, Math.round(wordCount))
+    };
+  }
+
+  async function aceSaveBindingWithVerifiedBaseline(surface, project) {
+    const currentSnapshot = await aceVerifiedBindingSnapshot(surface);
+    const result = await aceSaveBinding(surface, project.id, {
+      verifiedWordCount: currentSnapshot.wordCount,
+      verifiedWordCountSource: currentSnapshot.currentCountSource || currentSnapshot.method || "google-docs-binding"
+    });
+    const selectedProject = result.project || project;
+    await aceSaveLocalDocumentBinding(surface, selectedProject);
+    await aceSaveBaselineFromCurrentSnapshot(surface, selectedProject, {
+      ...currentSnapshot,
+      currentCountSource: currentSnapshot.currentCountSource || currentSnapshot.method || "google-docs-binding"
+    });
+    return {
+      binding: result,
+      project: selectedProject,
+      currentSnapshot
+    };
   }
 
   async function aceSaveBaselineFromCurrentSnapshot(surface, project, currentSnapshot) {
@@ -2660,20 +2780,117 @@
     if (hasStableVisible) {
       const selectedEndWordCount = Math.max(0, visibleWordCount);
       const netWordsChanged = aceCalculateNetWordDelta(baselineWordCount, selectedEndWordCount);
-      const immediateApiWordCount = Number(apiResponse?.apiWordCount ?? apiResponse?.wordCount);
-      const immediateApiAvailable = Boolean(apiResponse?.ok && Number.isFinite(immediateApiWordCount));
+      const selectedVisibleZeroAfterPositiveStart = selectedEndWordCount === 0 && baselineWordCount > 0;
+      const decisionApiResponse = selectedVisibleZeroAfterPositiveStart && !apiResponse
+        ? await aceWithTimeout(apiPromise, apiTimeoutMs, aceApiTimeoutResponse(apiTimeoutMs))
+        : apiResponse;
+      const immediateApiWordCount = Number(decisionApiResponse?.apiWordCount ?? decisionApiResponse?.wordCount);
+      const immediateApiAvailable = Boolean(decisionApiResponse?.ok && Number.isFinite(immediateApiWordCount));
       const immediateApiMismatch = immediateApiAvailable
         && Math.max(0, immediateApiWordCount) !== selectedEndWordCount;
+      const immediateApiEndWordCount = immediateApiAvailable ? Math.max(0, immediateApiWordCount) : null;
+      const visibleZeroApiPositiveMismatch = selectedVisibleZeroAfterPositiveStart
+        && Number.isFinite(immediateApiEndWordCount)
+        && immediateApiEndWordCount > 0;
+      const visibleZeroWithoutActivity = selectedVisibleZeroAfterPositiveStart && !hadDocumentActivity;
+
+      if (visibleZeroWithoutActivity && immediateApiEndWordCount === baselineWordCount) {
+        const apiNetWordsChanged = aceCalculateNetWordDelta(baselineWordCount, immediateApiEndWordCount);
+        const wordCountDiagnostic = aceGoogleDocNetDiagnostic({
+          code: "W-VISIBLE-ZERO-API-UNCHANGED",
+          attempt: 1,
+          startWordCount: baselineWordCount,
+          apiEndWordCount: immediateApiEndWordCount,
+          visibleEndWordCount: selectedEndWordCount,
+          netWordsChanged: apiNetWordsChanged,
+          revisionChanged: false,
+          startRevisionId,
+          endRevisionId: decisionApiResponse?.revisionId || "",
+          startSource: "stored-start-count",
+          endSource: "google-docs-api",
+          details: `stable visible zero rejected because API matched the session start and no document activity was detected. ${stableVisible.diagnostic || ""}`
+        });
+        timing.compareElapsedMs += aceTimingElapsedMs(compareStartedAt);
+        aceCompleteWordCountTiming(timing, {
+          apiPendingAtDecision: false,
+          finalSelectedCountSource: "google-docs-api",
+          trustedReason: "visible zero conflicted with unchanged API count and no document activity",
+          action: "sync-session"
+        });
+        return {
+          ...(decisionApiResponse || {}),
+          ok: true,
+          status: decisionApiResponse?.status || 200,
+          method: "google-docs-api",
+          wordCount: immediateApiEndWordCount,
+          apiWordCount: immediateApiEndWordCount,
+          visibleWordCount: selectedEndWordCount,
+          visibleCountDiagnostic: stableVisible,
+          wordsAdded: 0,
+          wordsRemoved: 0,
+          netWordsChanged: apiNetWordsChanged,
+          wordCounts: null,
+          endWordCounts: null,
+          wordCountTokenizerVersion: decisionApiResponse?.wordCountTokenizerVersion || "",
+          wordCountDiagnostic,
+          error: "",
+          timing
+        };
+      }
+
+      if (visibleZeroApiPositiveMismatch || (visibleZeroWithoutActivity && !immediateApiAvailable)) {
+        const wordCountDiagnostic = aceGoogleDocNetDiagnostic({
+          code: "E-SUSPICIOUS-VISIBLE-ZERO",
+          attempt: 1,
+          startWordCount: baselineWordCount,
+          apiEndWordCount: immediateApiEndWordCount,
+          visibleEndWordCount: selectedEndWordCount,
+          netWordsChanged,
+          revisionChanged: false,
+          startRevisionId,
+          endRevisionId: decisionApiResponse?.revisionId || "",
+          startSource: "stored-start-count",
+          endSource: "none",
+          details: `stable visible zero was not trusted for a positive-start session. ${stableVisible.diagnostic || ""}`
+        });
+        timing.compareElapsedMs += aceTimingElapsedMs(compareStartedAt);
+        aceCompleteWordCountTiming(timing, {
+          apiPendingAtDecision: false,
+          finalSelectedCountSource: "none",
+          trustedReason: "stable visible zero conflicted with API or lacked activity evidence",
+          action: "measurement-pending"
+        });
+        return {
+          ...(decisionApiResponse || {}),
+          ok: false,
+          status: decisionApiResponse?.status || 200,
+          method: "measurement-pending",
+          wordCount: null,
+          apiWordCount: immediateApiEndWordCount,
+          visibleWordCount: selectedEndWordCount,
+          visibleCountDiagnostic: stableVisible,
+          wordsAdded: 0,
+          wordsRemoved: 0,
+          netWordsChanged: 0,
+          wordCounts: null,
+          endWordCounts: null,
+          wordCountTokenizerVersion: decisionApiResponse?.wordCountTokenizerVersion || "",
+          wordCountDiagnostic,
+          error: "E-SUSPICIOUS-VISIBLE-ZERO: Stable visible count read 0, but that was not trusted for this session end.",
+          timing
+        };
+      }
+
       const wordCountDiagnostic = aceGoogleDocNetDiagnostic({
         code: immediateApiMismatch ? "W-API-VISIBLE-MISMATCH" : "D-STABLE-VISIBLE-NET",
         attempt: 1,
         startWordCount: baselineWordCount,
-        apiEndWordCount: immediateApiAvailable ? Math.max(0, immediateApiWordCount) : null,
+        apiEndWordCount: immediateApiEndWordCount,
         visibleEndWordCount: selectedEndWordCount,
         netWordsChanged,
         revisionChanged: false,
         startRevisionId,
-        endRevisionId: apiResponse?.revisionId || "",
+        endRevisionId: decisionApiResponse?.revisionId || "",
         startSource: "stored-start-count",
         endSource: "stable-visible",
         details: immediateApiMismatch
@@ -2702,12 +2919,12 @@
       }
 
       selectedResponse = {
-        ...(apiResponse || {}),
+        ...(decisionApiResponse || {}),
         ok: true,
-        status: apiResponse?.status || 200,
+        status: decisionApiResponse?.status || 200,
         method: "stable-visible-count",
         wordCount: selectedEndWordCount,
-        apiWordCount: immediateApiAvailable ? Math.max(0, immediateApiWordCount) : null,
+        apiWordCount: immediateApiEndWordCount,
         visibleWordCount: selectedEndWordCount,
         visibleCountDiagnostic: stableVisible,
         wordsAdded: 0,
@@ -2715,14 +2932,14 @@
         netWordsChanged,
         wordCounts: null,
         endWordCounts: null,
-        wordCountTokenizerVersion: apiResponse?.wordCountTokenizerVersion || "",
+        wordCountTokenizerVersion: decisionApiResponse?.wordCountTokenizerVersion || "",
         wordCountDiagnostic,
         error: "",
         timing
       };
       timing.compareElapsedMs += aceTimingElapsedMs(compareStartedAt);
       aceCompleteWordCountTiming(timing, {
-        apiPendingAtDecision: !apiResponse,
+        apiPendingAtDecision: !decisionApiResponse,
         finalSelectedCountSource: "stable-visible",
         trustedReason: "stable active-tab visible count matched twice",
         action: "sync-session"
@@ -2936,7 +3153,9 @@
       ? Math.max(0, Number(options.apiTimeoutMs))
       : ACE_GOOGLE_DOC_API_TIMEOUT_MS;
     const compareStartedAt = aceNowMs();
-    const boundedApiResponse = hasStableVisible
+    const selectedVisibleZero = hasStableVisible && Math.max(0, visibleWordCount) === 0;
+    const shouldVerifyVisibleZero = selectedVisibleZero && Boolean(options.verifyZeroWithApi);
+    const boundedApiResponse = hasStableVisible && !shouldVerifyVisibleZero
       ? apiResponse
       : apiResponse || await aceWithTimeout(apiPromise, apiTimeoutMs, aceApiTimeoutResponse(apiTimeoutMs));
     const apiWordCount = Number(boundedApiResponse?.wordCount ?? boundedApiResponse?.apiWordCount);
@@ -2949,6 +3168,86 @@
       ? aceCalculateNetWordDelta(baselineWordCount, selectedWordCount)
       : 0;
 
+    if (
+      hasStableVisible
+      && shouldVerifyVisibleZero
+      && apiAvailable
+      && Math.max(0, apiWordCount) > 0
+      && options.apiSurfaceTrusted
+    ) {
+      const selectedApiCount = Math.max(0, apiWordCount);
+      const apiNetWordsChanged = aceCalculateNetWordDelta(baselineWordCount, selectedApiCount);
+      timing.compareElapsedMs += aceTimingElapsedMs(compareStartedAt);
+      aceCompleteWordCountTiming(timing, {
+        apiPendingAtDecision: false,
+        finalSelectedCountSource: "google-docs-api",
+        trustedReason: "visible zero rejected because verified API count was positive",
+        action: options.successAction || (apiNetWordsChanged === 0 ? "no-catch-up" : "show-catch-up")
+      });
+      return {
+        ...boundedApiResponse,
+        ok: true,
+        status: boundedApiResponse.status || 200,
+        method: "google-docs-api",
+        wordCount: selectedApiCount,
+        apiWordCount: selectedApiCount,
+        visibleWordCount: selectedWordCount,
+        visibleCountDiagnostic: stableVisible,
+        visibleCandidates: aceCatchUpVisibleCandidateSummary(stableVisible),
+        netWordsChanged: apiNetWordsChanged,
+        currentCountSource: "google-docs-api",
+        currentCountTrusted: true,
+        apiVisibleMismatch: true,
+        wordCountDiagnostic: aceCatchUpSnapshotDiagnostic({
+          code: "W-VISIBLE-ZERO-API-POSITIVE",
+          baselineWordCount,
+          apiWordCount: selectedApiCount,
+          visibleWordCount: selectedWordCount,
+          netWordsChanged: apiNetWordsChanged,
+          apiResponse: boundedApiResponse,
+          stableVisible,
+          endSource: "google-docs-api",
+          details: "stable visible zero rejected because verified API count was positive"
+        }),
+        error: "",
+        timing
+      };
+    }
+
+    if (hasStableVisible && shouldVerifyVisibleZero && !apiAvailable) {
+      timing.compareElapsedMs += aceTimingElapsedMs(compareStartedAt);
+      aceCompleteWordCountTiming(timing, {
+        apiPendingAtDecision: false,
+        finalSelectedCountSource: "none",
+        trustedReason: "visible zero could not be verified by API",
+        action: "diagnostic-only"
+      });
+      return {
+        ...boundedApiResponse,
+        ok: false,
+        skipCatchUp: true,
+        wordCount: null,
+        apiWordCount: null,
+        visibleWordCount: selectedWordCount,
+        visibleCountDiagnostic: stableVisible,
+        visibleCandidates: aceCatchUpVisibleCandidateSummary(stableVisible),
+        netWordsChanged: 0,
+        currentCountSource: "none",
+        currentCountTrusted: false,
+        wordCountDiagnostic: aceCatchUpSnapshotDiagnostic({
+          code: "E-VISIBLE-ZERO-UNVERIFIED",
+          baselineWordCount,
+          apiWordCount: null,
+          visibleWordCount: selectedWordCount,
+          stableVisible,
+          endSource: "none",
+          details: "stable visible zero was not accepted because API confirmation was unavailable"
+        }),
+        error: "E-VISIBLE-ZERO-UNVERIFIED: Could not verify an empty document word count.",
+        timing
+      };
+    }
+
     if (!hasStableVisible) {
       const apiFallbackAllowed = Boolean(options.apiSurfaceTrusted);
       if (apiAvailable && apiFallbackAllowed) {
@@ -2959,7 +3258,7 @@
           apiPendingAtDecision: false,
           finalSelectedCountSource: "google-docs-api",
           trustedReason: "visible unavailable; API surface explicitly trusted",
-          action: apiNetWordsChanged === 0 ? "no-catch-up" : "show-catch-up"
+          action: options.successAction || (apiNetWordsChanged === 0 ? "no-catch-up" : "show-catch-up")
         });
         return {
           ...boundedApiResponse,
@@ -3050,7 +3349,7 @@
       apiPendingAtDecision: !apiResponse,
       finalSelectedCountSource: "stable-visible",
       trustedReason: "stable active-tab visible count matched twice",
-      action: netWordsChanged === 0 ? "no-catch-up" : "show-catch-up"
+      action: options.successAction || (netWordsChanged === 0 ? "no-catch-up" : "show-catch-up")
     });
     return {
       ...(apiResponse || {}),
@@ -3404,6 +3703,9 @@
     const unknownCopy = aceSurfaceConfidence(currentSurface)
       ? ""
       : '<div class="ace-sync-copy ace-sync-copy--pending">Couldn’t identify this tab. Refresh Google Docs.</div>';
+    const statusCopy = aceSyncMessage
+      ? `<div class="ace-sync-copy ace-sync-copy--${aceEscapeHtml(aceSyncStatus || "pending")}">${aceEscapeHtml(aceSyncMessage)}</div>`
+      : "";
     aceWidget.className = "ace-widget ace-widget--prompt";
     aceWidget.innerHTML = `
       ${aceCloseButtonHtml()}
@@ -3412,6 +3714,7 @@
       <div class="ace-field-readout"><span>Current tab</span><strong>${aceEscapeHtml(currentTab)}</strong></div>
       <div class="ace-prompt-copy">Return to "${aceEscapeHtml(originalTab)}" or end this session.</div>
       ${unknownCopy}
+      ${statusCopy}
       <div class="ace-actions">
         <button class="ace-button ace-button--primary" type="button" data-ace-action="go-back-tab">Go back</button>
         <button class="ace-button ace-button--end" type="button" data-ace-action="end">End session</button>
@@ -4207,6 +4510,125 @@
     aceStartTimer();
   }
 
+  function aceSessionChromeTabId(session = aceActiveSession) {
+    return aceNormalizeChromeTabId(session?.chromeTabId || session?.sessionScope?.chromeTabId || "");
+  }
+
+  function aceGoogleDocSurfaceHash(surface) {
+    const params = new URLSearchParams();
+    params.set("tab", aceNormalizeTabId(surface?.tabId));
+    if (surface?.tabTitle) {
+      params.set("tabTitle", aceNormalizeTabTitle(surface.tabTitle));
+    }
+    return `#${params.toString()}`;
+  }
+
+  function aceNavigateToManuscriptSurface(surface) {
+    if (!surface?.documentId) {
+      return;
+    }
+    const hash = aceGoogleDocSurfaceHash(surface);
+    const currentDocumentId = aceExtractDocumentId();
+    if (currentDocumentId && currentDocumentId !== surface.documentId) {
+      window.location.href = `https://docs.google.com/document/d/${encodeURIComponent(surface.documentId)}/edit${hash}`;
+      return;
+    }
+
+    window.location.hash = hash;
+    if (window.location?.href) {
+      const base = window.location.href.split("#")[0];
+      window.location.href = `${base}${hash}`;
+    }
+  }
+
+  async function aceReturnToActiveSessionTab(options = {}) {
+    console.log("[Session Pause] Go Back clicked");
+    if (!aceActiveSession) {
+      aceSyncStatus = "pending";
+      aceSyncMessage = "No active session is available.";
+      aceState = "prompt";
+      aceRenderPrompt();
+      return { ok: false, reason: "no-active-session" };
+    }
+
+    const sessionSurface = aceSessionManuscriptSurface(aceActiveSession);
+    const sessionChromeTabId = aceSessionChromeTabId(aceActiveSession);
+    const currentScope = await aceGetCurrentDocumentScope(aceActiveSession.projectId || "");
+    const currentChromeTabId = aceNormalizeChromeTabId(currentScope.chromeTabId);
+
+    console.log("[Session Pause]", {
+      activeSessionId: aceActiveSession.extensionSessionId || "",
+      projectId: aceActiveSession.projectId || "",
+      originatingTabId: sessionChromeTabId,
+      documentId: sessionSurface.documentId
+    });
+
+    if (sessionChromeTabId && currentChromeTabId && sessionChromeTabId !== currentChromeTabId) {
+      const response = await aceFocusChromeTab(sessionChromeTabId);
+      if (response?.ok) {
+        console.log("[Session Pause] Returned to active tab");
+        return { ok: true, action: "focused-chrome-tab" };
+      }
+
+      console.error("[Session Pause] Unable to locate originating tab", response);
+      aceSyncStatus = "pending";
+      aceSyncMessage = "Original writing tab is no longer available.";
+      aceRenderTabChangedBlock(aceCurrentManuscriptSurface());
+      return { ok: false, reason: "original-tab-unavailable", error: response?.error || "" };
+    }
+
+    aceNavigateToManuscriptSurface(sessionSurface);
+    await aceHandleSurfaceLifecycleChange(options.trigger || "session-pause-go-back");
+
+    if (aceActiveSession && !aceSessionSurfaceMismatch(aceActiveSession, aceCurrentManuscriptSurface())) {
+      console.log("[Session Pause] Returned to active tab");
+      return { ok: true, action: "navigated-current-tab" };
+    }
+
+    console.error("[Session Pause] Unable to locate originating tab");
+    aceSyncStatus = "pending";
+    aceSyncMessage = "Unable to locate the original writing tab.";
+    aceRenderTabChangedBlock(aceCurrentManuscriptSurface());
+    return { ok: false, reason: "surface-mismatch" };
+  }
+
+  async function aceEndBlockedSession() {
+    console.log("[Session Pause] End Session clicked");
+    if (!aceActiveSession) {
+      aceSyncStatus = "pending";
+      aceSyncMessage = "Unable to open session ending workflow.";
+      aceState = "prompt";
+      aceRenderPrompt();
+      return { ok: false, reason: "no-active-session" };
+    }
+
+    const sessionChromeTabId = aceSessionChromeTabId(aceActiveSession);
+    const currentScope = await aceGetCurrentDocumentScope(aceActiveSession.projectId || "");
+    const currentChromeTabId = aceNormalizeChromeTabId(currentScope.chromeTabId);
+
+    if (sessionChromeTabId && currentChromeTabId && sessionChromeTabId !== currentChromeTabId) {
+      const response = await aceRequestEndSessionInChromeTab(aceActiveSession);
+      if (response?.ok) {
+        return { ok: true, action: "requested-owning-tab-end" };
+      }
+      aceSyncStatus = "pending";
+      aceSyncMessage = response?.error || "Unable to open session ending workflow.";
+      aceRenderTabChangedBlock(aceCurrentManuscriptSurface());
+      return { ok: false, reason: "remote-end-failed", error: response?.error || "" };
+    }
+
+    const returned = await aceReturnToActiveSessionTab({ trigger: "session-pause-end" });
+    if (!returned.ok) {
+      aceSyncStatus = "pending";
+      aceSyncMessage = "Unable to open session ending workflow.";
+      aceRenderTabChangedBlock(aceCurrentManuscriptSurface());
+      return returned;
+    }
+
+    await aceEndSession();
+    return { ok: true, action: "ended-current-tab-session" };
+  }
+
   async function aceHandleSurfaceLifecycleChange(trigger = "surface-check") {
     const nextSurface = aceCurrentManuscriptSurface();
     const previousSurfaceId = aceLastResolvedSurfaceId;
@@ -4563,10 +4985,7 @@
     }
 
     try {
-      const binding = await aceSaveBinding(draft, project.id);
-      const selectedProject = binding.project || project;
-      await aceSaveLocalDocumentBinding(draft, selectedProject);
-      await aceRefreshDocumentBaselineFromCurrentCount(draft, selectedProject);
+      const { project: selectedProject } = await aceSaveBindingWithVerifiedBaseline(draft, project);
       if (aceIssueDraft !== draft) {
         return;
       }
@@ -4764,9 +5183,7 @@
       if (!project?.id) {
         throw new Error("Project was not created.");
       }
-      const binding = await aceSaveBinding(surface, project.id);
-      const selectedProject = binding.project || project;
-      await aceSaveLocalDocumentBinding(surface, selectedProject);
+      const { project: selectedProject, currentSnapshot } = await aceSaveBindingWithVerifiedBaseline(surface, project);
       aceCurrentBinding = {
         ...surface,
         projectId: selectedProject.id,
@@ -4776,11 +5193,7 @@
       aceCreateProjectDraft = null;
       aceCreateProjectStep = 0;
       aceCreateProjectError = "";
-      const reconciliation = await aceReconcileInitialBindBaseline(surface, selectedProject);
-      if (reconciliation.candidate) {
-        return;
-      }
-      acePromptError = `Bound to ${selectedProject.bookTitle}.`;
+      acePromptError = `Document connected. Verified manuscript size: ${aceFormatNumber(currentSnapshot.wordCount)} words. Scriptor will use this as the starting point for future writing statistics.`;
       aceState = "prompt";
       aceRenderPrompt();
     } catch (error) {
@@ -6147,9 +6560,7 @@
     aceRenderLoading("Binding project...", "Saving this manuscript.");
     await aceNextFrame();
     try {
-      const result = await aceSaveBinding(surface, project.id);
-      const selectedProject = result.project || project;
-      await aceSaveLocalDocumentBinding(surface, selectedProject);
+      const { project: selectedProject, currentSnapshot } = await aceSaveBindingWithVerifiedBaseline(surface, project);
       aceCurrentSurface = surface;
       aceCurrentBinding = {
         ...surface,
@@ -6157,15 +6568,7 @@
         project: selectedProject
       };
       aceSelectedProject = selectedProject;
-      if (options.skipInitialCatchUp) {
-        await aceRefreshDocumentBaselineFromCurrentCount(surface, selectedProject);
-      } else {
-        const reconciliation = await aceReconcileInitialBindBaseline(surface, selectedProject);
-        if (reconciliation.candidate) {
-          return;
-        }
-      }
-      acePromptError = `Bound to ${selectedProject.bookTitle}.`;
+      acePromptError = `Document connected. Verified manuscript size: ${aceFormatNumber(currentSnapshot.wordCount)} words. Scriptor will use this as the starting point for future writing statistics.`;
       aceState = "prompt";
       aceRenderPrompt();
     } catch (error) {
@@ -6761,6 +7164,33 @@
     aceRegisterWritingActivity();
   }
 
+  function aceStartRuntimeMessageListener() {
+    const runtime = aceChromeRuntime();
+    if (!runtime?.runtime?.onMessage?.addListener) {
+      return;
+    }
+    runtime.runtime.onMessage.addListener(function (message, _sender, sendResponse) {
+      if (message?.aceType !== "ace-end-active-session") {
+        return false;
+      }
+      if (!ACE_IS_TOP_FRAME) {
+        sendResponse({ ok: false, error: "Session ending must run in the top Google Docs frame." });
+        return false;
+      }
+      if (
+        message.extensionSessionId
+        && aceActiveSession?.extensionSessionId
+        && message.extensionSessionId !== aceActiveSession.extensionSessionId
+      ) {
+        sendResponse({ ok: false, error: "Active session does not match the requested session." });
+        return false;
+      }
+      aceRunAsync(aceEndSession(), "end session from owning tab");
+      sendResponse({ ok: true });
+      return false;
+    });
+  }
+
   function aceGetAnchorPoint(position) {
     const rect = aceWidget.getBoundingClientRect();
     const width = rect.width || 120;
@@ -6983,9 +7413,13 @@
     } else if (action === "decline-start") {
       aceDeclineStart();
     } else if (action === "end") {
-      aceRunAsync(aceEndSession(), "end session");
+      if (aceState === "tab-blocked") {
+        aceRunAsync(aceEndBlockedSession(), "end blocked session");
+      } else {
+        aceRunAsync(aceEndSession(), "end session");
+      }
     } else if (action === "go-back-tab") {
-      aceRenderTabChangedBlock(aceCurrentManuscriptSurface());
+      aceRunAsync(aceReturnToActiveSessionTab(), "return to active session tab");
     } else if (action === "switch") {
       aceRunAsync(aceSwitchSessionType(), "switch session type");
     } else if (action === "open") {
@@ -7142,6 +7576,7 @@
       aceClassifyBindingValidation,
       aceReconcileProjectPickerBindings,
       aceClearStaleProjectBinding,
+      aceGetExtensionProjects,
       aceGetDocumentBaseline,
       aceGetDocumentBaselineForCatchUp,
       aceSaveDocumentBaseline,
@@ -7179,6 +7614,8 @@
       aceCheckCatchUpForCurrentSurface,
       aceBlockActiveSessionForTabSwitch,
       aceResumeActiveSessionForSurface,
+      aceReturnToActiveSessionTab,
+      aceEndBlockedSession,
       aceChooseProject,
       aceShowDeletedBindingRebindConfirm,
       aceConfirmDeletedBindingRebind,
@@ -7242,6 +7679,7 @@
     window.addEventListener("pagehide", aceHandleDocumentExit);
     window.addEventListener("beforeunload", aceHandleDocumentExit);
 
+    aceStartRuntimeMessageListener();
     aceRunAsync(aceInitializeSessionState(), "initialize session state");
   }
 

@@ -805,6 +805,163 @@ test("active session blocks on tab switch and resumes on original tab", async ()
   assert(state.activeSession.pausedDurationMs >= 0);
 });
 
+test("tab changed modal go back returns to the active manuscript tab", async () => {
+  const activeSession = session({
+    tabId: "tabA",
+    tabTitle: "Tab A",
+    manuscriptSurfaceId: "doc-test:tabA",
+    manuscriptSurfaceLabel: "Tab A",
+    chromeTabId: "1",
+    startedAt: new Date(Date.now() - 60000).toISOString(),
+    project: { id: "project-a", bookTitle: "Project A" },
+    projectId: "project-a"
+  });
+  const { exports, context } = loadContent({
+    topFrame: true,
+    chromeTabId: 1,
+    location: {
+      href: "https://docs.google.com/document/d/doc-test/edit#tab=tabB&tabTitle=Tab%20B",
+      hash: "#tab=tabB&tabTitle=Tab%20B"
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await exports.aceHandleSurfaceLifecycleChange("test-init");
+  exports.aceSetTestState({
+    state: "tab-blocked",
+    activeSession
+  });
+
+  const result = await exports.aceReturnToActiveSessionTab();
+
+  const state = exports.aceTestState();
+  assert.equal(result.ok, true);
+  assert.equal(context.location.hash, "#tab=tabA&tabTitle=Tab+A");
+  assert.equal(state.state, "active");
+  assert.equal(state.activeSession.tabBlockedAt || "", "");
+  assert.doesNotMatch(state.widgetHtml, /Tab changed/);
+});
+
+test("tab changed modal end session routes through normal session completion", async () => {
+  const activeSession = session({
+    tabId: "tabA",
+    tabTitle: "Tab A",
+    manuscriptSurfaceId: "doc-test:tabA",
+    manuscriptSurfaceLabel: "Tab A",
+    chromeTabId: "1",
+    sessionScope: {
+      projectId: "project-a",
+      documentId: "doc-test",
+      tabId: "tabA",
+      tabTitle: "Tab A",
+      manuscriptSurfaceId: "doc-test:tabA",
+      manuscriptSurfaceLabel: "Tab A",
+      chromeTabId: "1"
+    },
+    startedAt: new Date(Date.now() - 60000).toISOString(),
+    startDocumentWordCount: 1000,
+    startDocumentRevisionId: "start",
+    project: { id: "project-a", bookTitle: "Project A" },
+    projectId: "project-a"
+  });
+  const calls = [];
+  const { exports } = loadContent({
+    topFrame: true,
+    chromeTabId: 1,
+    visibleWordCount: 900,
+    location: {
+      href: "https://docs.google.com/document/d/doc-test/edit#tab=tabB&tabTitle=Tab%20B",
+      hash: "#tab=tabB&tabTitle=Tab%20B"
+    },
+    sendMessage(message, callback) {
+      calls.push(message);
+      if (message.aceType === "ace-google-doc-net-count") {
+        callback({
+          ok: true,
+          status: 200,
+          wordCount: 900,
+          apiWordCount: 900,
+          visibleWordCount: 900,
+          netWordsChanged: -100,
+          revisionId: "end",
+          wordCountDiagnostic: "test diagnostic"
+        });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        callback({ ok: true, payload: { session: { id: "server-session" } } });
+        return;
+      }
+      callback({ ok: true });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await exports.aceHandleSurfaceLifecycleChange("test-init");
+  exports.aceSetTestState({
+    state: "tab-blocked",
+    activeSession
+  });
+
+  const result = await exports.aceEndBlockedSession();
+
+  const state = exports.aceTestState();
+  assert.equal(result.ok, true);
+  assert.equal(state.state, "completed");
+  assert.equal(state.completedSession.netWordsChanged, -100);
+  assert.equal(calls.some((message) => message.aceType === "ace-api-fetch"), true);
+});
+
+test("tab changed modal go back reports when original Chrome tab is unavailable", async () => {
+  const activeSession = session({
+    documentId: "doc-a",
+    tabId: "tabA",
+    tabTitle: "Tab A",
+    manuscriptSurfaceId: "doc-a:tabA",
+    manuscriptSurfaceLabel: "Tab A",
+    chromeTabId: "101",
+    sessionScope: {
+      projectId: "project-a",
+      documentId: "doc-a",
+      tabId: "tabA",
+      tabTitle: "Tab A",
+      manuscriptSurfaceId: "doc-a:tabA",
+      manuscriptSurfaceLabel: "Tab A",
+      chromeTabId: "101"
+    },
+    startedAt: new Date(Date.now() - 60000).toISOString(),
+    project: { id: "project-a", bookTitle: "Project A" },
+    projectId: "project-a"
+  });
+  const { exports } = loadContent({
+    topFrame: true,
+    chromeTabId: 202,
+    location: {
+      href: "https://docs.google.com/document/d/doc-b/edit#tab=tabB&tabTitle=Tab%20B",
+      pathname: "/document/d/doc-b/edit",
+      hash: "#tab=tabB&tabTitle=Tab%20B"
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-focus-chrome-tab") {
+        callback({ ok: false, error: "Original writing tab is no longer available." });
+        return;
+      }
+      callback({ ok: true });
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  await exports.aceHandleSurfaceLifecycleChange("test-init");
+  exports.aceSetTestState({
+    state: "tab-blocked",
+    activeSession
+  });
+
+  const result = await exports.aceReturnToActiveSessionTab();
+
+  const state = exports.aceTestState();
+  assert.equal(result.ok, false);
+  assert.equal(state.state, "tab-blocked");
+  assert.match(state.widgetHtml, /Original writing tab is no longer available/);
+});
+
 test("tab title rename keeps surface id and updates active session metadata", async () => {
   const activeSession = session({
     tabId: "tabA",
@@ -1077,6 +1234,145 @@ test("session end records API mismatch but keeps stable visible count", async ()
   assert.match(result.wordCountDiagnostic, /W-API-VISIBLE-MISMATCH|D-STABLE-VISIBLE-NET/);
 });
 
+test("session end rejects false visible zero when API is unchanged and no activity occurred", async () => {
+  const { exports } = loadContent();
+  const reads = [0, 0];
+
+  const result = await exports.aceGoogleDocNetAfterSave(
+    "doc-test",
+    "session-test",
+    522,
+    "start-revision",
+    false,
+    {
+      settleDelayMs: 0,
+      visibleDelayMs: 0,
+      visibleTimeoutMs: 100,
+      readVisibleCount: async () => {
+        const count = reads.shift();
+        return {
+          count,
+          candidates: [{ count, snippet: `${count} words` }],
+          selectedCandidate: { count, snippet: `${count} words` }
+        };
+      },
+      apiCall: async () => ({ ok: true, wordCount: 522, revisionId: "api-revision" })
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.wordCount, 522);
+  assert.equal(result.visibleWordCount, 0);
+  assert.equal(result.netWordsChanged, 0);
+  assert.equal(result.method, "google-docs-api");
+  assert.match(result.wordCountDiagnostic, /W-VISIBLE-ZERO-API-UNCHANGED/);
+});
+
+test("session end does not sync suspicious visible zero when API still sees words", async () => {
+  const { exports } = loadContent();
+  const reads = [0, 0];
+
+  const result = await exports.aceGoogleDocNetAfterSave(
+    "doc-test",
+    "session-test",
+    522,
+    "start-revision",
+    true,
+    {
+      settleDelayMs: 0,
+      visibleDelayMs: 0,
+      visibleTimeoutMs: 100,
+      readVisibleCount: async () => {
+        const count = reads.shift();
+        return {
+          count,
+          candidates: [{ count, snippet: `${count} words` }],
+          selectedCandidate: { count, snippet: `${count} words` }
+        };
+      },
+      apiCall: async () => ({ ok: true, wordCount: 522, revisionId: "api-revision" })
+    }
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.wordCount, null);
+  assert.equal(result.visibleWordCount, 0);
+  assert.equal(result.apiWordCount, 522);
+  assert.equal(result.netWordsChanged, 0);
+  assert.match(result.wordCountDiagnostic, /E-SUSPICIOUS-VISIBLE-ZERO/);
+});
+
+test("binding baseline rejects false visible zero when API returns positive count", async () => {
+  const { exports } = loadContent();
+  const reads = [0, 0];
+
+  const result = await exports.aceGoogleDocWordCountAfterSettle(
+    "doc-test",
+    { endDocumentWordCount: 0 },
+    {
+      trigger: "bind-baseline",
+      successAction: "baseline-initialized",
+      verifyZeroWithApi: true,
+      apiSurfaceTrusted: true,
+      settleDelayMs: 0,
+      visibleDelayMs: 0,
+      visibleTimeoutMs: 100,
+      apiTimeoutMs: 100,
+      readVisibleCount: async () => {
+        const count = reads.shift();
+        return {
+          count,
+          candidates: [{ count, snippet: `${count} words` }],
+          selectedCandidate: { count, snippet: `${count} words` }
+        };
+      },
+      apiCall: async () => ({ ok: true, wordCount: 522, revisionId: "api-revision" })
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.wordCount, 522);
+  assert.equal(result.visibleWordCount, 0);
+  assert.equal(result.currentCountSource, "google-docs-api");
+  assert.equal(result.method, "google-docs-api");
+  assert.match(result.wordCountDiagnostic, /W-VISIBLE-ZERO-API-POSITIVE/);
+});
+
+test("binding baseline does not accept visible zero without API confirmation", async () => {
+  const { exports } = loadContent();
+  const reads = [0, 0];
+
+  const result = await exports.aceGoogleDocWordCountAfterSettle(
+    "doc-test",
+    { endDocumentWordCount: 0 },
+    {
+      trigger: "bind-baseline",
+      successAction: "baseline-initialized",
+      verifyZeroWithApi: true,
+      apiSurfaceTrusted: true,
+      settleDelayMs: 0,
+      visibleDelayMs: 0,
+      visibleTimeoutMs: 100,
+      apiTimeoutMs: 100,
+      readVisibleCount: async () => {
+        const count = reads.shift();
+        return {
+          count,
+          candidates: [{ count, snippet: `${count} words` }],
+          selectedCandidate: { count, snippet: `${count} words` }
+        };
+      },
+      apiCall: async () => ({ ok: false, wordCount: null, error: "api unavailable" })
+    }
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.wordCount, null);
+  assert.equal(result.visibleWordCount, 0);
+  assert.equal(result.currentCountSource, "none");
+  assert.match(result.wordCountDiagnostic, /E-VISIBLE-ZERO-UNVERIFIED/);
+});
+
 test("session end can use API only when surface is explicitly trusted", async () => {
   const { exports } = loadContent();
 
@@ -1210,10 +1506,14 @@ test("visible fallback net uses stabilized count", async () => {
 });
 
 test("backend compatibility accepts zeroed legacy fields and applies net words", () => {
-  const appPath = path.resolve(__dirname, "..", "..", "Author-companion", "writing_app");
+  const appPath = path.resolve(__dirname, "..", "..", "Author-companion", "scriptor_app");
+  const legacyAppPath = path.resolve(__dirname, "..", "..", "Author-companion", "writing_app");
   const script = `
 import json, sys
-sys.path.insert(0, ${JSON.stringify(appPath)})
+from pathlib import Path
+app_path = Path(${JSON.stringify(appPath)})
+legacy_app_path = Path(${JSON.stringify(legacyAppPath)})
+sys.path.insert(0, str(app_path if app_path.exists() else legacy_app_path))
 from extension_bridge import append_extension_session
 state = {
     "projects": [{"id": "project-test", "project": {"bookTitle": "Test", "currentWordCount": 714}, "sessions": []}],

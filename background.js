@@ -7,6 +7,8 @@
   const ACE_GOOGLE_DOC_START_SNAPSHOT_MESSAGE = "ace-google-doc-start-snapshot";
   const ACE_GOOGLE_DOC_NET_COUNT_MESSAGE = "ace-google-doc-net-count";
   const ACE_CURRENT_TAB_SCOPE_MESSAGE = "ace-current-tab-scope";
+  const ACE_FOCUS_CHROME_TAB_MESSAGE = "ace-focus-chrome-tab";
+  const ACE_END_SESSION_IN_TAB_MESSAGE = "ace-end-session-in-tab";
   const ACE_GOOGLE_DOCS_SCOPE = "https://www.googleapis.com/auth/documents.readonly";
   const ACE_WORD_SNAPSHOT_STORAGE_PREFIX = "aceWordSnapshot:";
   const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v3";
@@ -26,6 +28,32 @@
         frameId: sender?.frameId ?? null
       });
       return false;
+    }
+
+    if (message.aceType === ACE_FOCUS_CHROME_TAB_MESSAGE) {
+      aceFocusChromeTab(message)
+        .then(sendResponse)
+        .catch(function (error) {
+          sendResponse({
+            ok: false,
+            status: Number(error?.status) || 0,
+            error: error.message || "Unable to locate the original writing tab."
+          });
+        });
+      return true;
+    }
+
+    if (message.aceType === ACE_END_SESSION_IN_TAB_MESSAGE) {
+      aceEndSessionInChromeTab(message)
+        .then(sendResponse)
+        .catch(function (error) {
+          sendResponse({
+            ok: false,
+            status: Number(error?.status) || 0,
+            error: error.message || "Unable to open session ending workflow."
+          });
+        });
+      return true;
     }
 
     if (message.aceType === ACE_API_MESSAGE) {
@@ -90,6 +118,94 @@
     return false;
   });
 
+  function aceChromeTab(tabId) {
+    return new Promise(function (resolve, reject) {
+      const numericTabId = Number(tabId);
+      if (!Number.isFinite(numericTabId) || numericTabId <= 0 || !chrome.tabs?.get) {
+        reject(new Error("Original writing tab is no longer available."));
+        return;
+      }
+      chrome.tabs.get(numericTabId, function (tab) {
+        if (chrome.runtime?.lastError || !tab?.id) {
+          reject(new Error("Original writing tab is no longer available."));
+          return;
+        }
+        resolve(tab);
+      });
+    });
+  }
+
+  function aceUpdateChromeTab(tabId, updateProperties) {
+    return new Promise(function (resolve, reject) {
+      if (!chrome.tabs?.update) {
+        reject(new Error("Unable to focus the original writing tab."));
+        return;
+      }
+      chrome.tabs.update(Number(tabId), updateProperties, function (tab) {
+        if (chrome.runtime?.lastError) {
+          reject(new Error(chrome.runtime.lastError.message || "Unable to focus the original writing tab."));
+          return;
+        }
+        resolve(tab || null);
+      });
+    });
+  }
+
+  function aceFocusChromeWindow(windowId) {
+    return new Promise(function (resolve) {
+      if (!Number.isFinite(Number(windowId)) || !chrome.windows?.update) {
+        resolve();
+        return;
+      }
+      chrome.windows.update(Number(windowId), { focused: true }, function () {
+        resolve();
+      });
+    });
+  }
+
+  async function aceFocusChromeTab(message) {
+    const tab = await aceChromeTab(message.chromeTabId);
+    await aceUpdateChromeTab(tab.id, { active: true });
+    await aceFocusChromeWindow(tab.windowId);
+    return {
+      ok: true,
+      chromeTabId: tab.id,
+      windowId: tab.windowId
+    };
+  }
+
+  function aceSendMessageToTab(tabId, message) {
+    return new Promise(function (resolve, reject) {
+      if (!chrome.tabs?.sendMessage) {
+        reject(new Error("Unable to contact the original writing tab."));
+        return;
+      }
+      chrome.tabs.sendMessage(Number(tabId), message, function (response) {
+        if (chrome.runtime?.lastError) {
+          reject(new Error(chrome.runtime.lastError.message || "Unable to contact the original writing tab."));
+          return;
+        }
+        resolve(response || {});
+      });
+    });
+  }
+
+  async function aceEndSessionInChromeTab(message) {
+    const focused = await aceFocusChromeTab(message);
+    const response = await aceSendMessageToTab(focused.chromeTabId, {
+      aceType: "ace-end-active-session",
+      extensionSessionId: message.extensionSessionId || ""
+    });
+    if (!response?.ok) {
+      throw new Error(response?.error || "Unable to open session ending workflow.");
+    }
+    return {
+      ok: true,
+      chromeTabId: focused.chromeTabId,
+      windowId: focused.windowId
+    };
+  }
+
   async function aceFetchFromApp(message) {
     const path = String(message.path || "");
     if (!path.startsWith("/api/")) {
@@ -146,20 +262,67 @@
   }
 
   function aceGetScriptorSessionCookie() {
+    function getCookie(details) {
+      return new Promise(function (resolve) {
+        chrome.cookies.get(details, function (cookie) {
+          if (chrome.runtime?.lastError) {
+            console.warn("[ACE] APP SESSION COOKIE LOOKUP FAILED", {
+              method: "get",
+              error: chrome.runtime.lastError.message || ""
+            });
+          }
+          resolve(cookie?.value || "");
+        });
+      });
+    }
+
+    function getCookies(details) {
+      return new Promise(function (resolve) {
+        if (!chrome.cookies?.getAll) {
+          resolve([]);
+          return;
+        }
+        chrome.cookies.getAll(details, function (cookies) {
+          if (chrome.runtime?.lastError) {
+            console.warn("[ACE] APP SESSION COOKIE LOOKUP FAILED", {
+              method: "getAll",
+              error: chrome.runtime.lastError.message || ""
+            });
+          }
+          resolve(Array.isArray(cookies) ? cookies : []);
+        });
+      });
+    }
+
     return new Promise(function (resolve) {
       if (!chrome.cookies?.get) {
         resolve("");
         return;
       }
-      chrome.cookies.get(
-        {
-          url: ACE_API_BASE_URL,
+      resolve((async function () {
+        const byUrl = await getCookie({
+          url: `${ACE_API_BASE_URL}/`,
           name: ACE_SCRIPTOR_SESSION_COOKIE
-        },
-        function (cookie) {
-          resolve(cookie?.value || "");
+        });
+        if (byUrl) {
+          return byUrl;
         }
-      );
+
+        let appHost = "";
+        try {
+          appHost = new URL(ACE_API_BASE_URL).hostname;
+        } catch (_error) {
+          return "";
+        }
+        const byDomain = await getCookies({
+          domain: appHost,
+          name: ACE_SCRIPTOR_SESSION_COOKIE
+        });
+        const exactCookie = byDomain.find(function (cookie) {
+          return cookie.domain === appHost || cookie.domain === `.${appHost}`;
+        }) || byDomain[0];
+        return exactCookie?.value || "";
+      })());
     });
   }
 
@@ -633,6 +796,8 @@
     Object.assign(globalThis.__ACE_TEST_EXPORTS__, {
       aceStoreGoogleDocStartSnapshot,
       aceFetchFromApp,
+      aceFocusChromeTab,
+      aceEndSessionInChromeTab,
       aceFetchGoogleDocNetCount,
       aceFetchGoogleDocSnapshot,
       aceExtractGoogleDocText,
