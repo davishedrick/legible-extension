@@ -528,16 +528,16 @@ test("manual session start shows positive catch-up before starting", async () =>
   const project = projectFactory({ id: "project-catchup", bookTitle: "Catchup Project" });
   const { exports } = loadContent({
     topFrame: true,
-    visibleWordCount: 500,
+    visibleWordCount: 10800,
     location: locationForSurface(surface),
     initialStorage: {
       aceDocumentBaselines: {
-        [surface.manuscriptSurfaceId]: baselineFactory(0, { ...surface, project })
+        [surface.manuscriptSurfaceId]: baselineFactory(10305, { ...surface, project })
       }
     },
     sendMessage(message, callback) {
       if (message.aceType === "ace-google-doc-word-count") {
-        callback({ ok: true, status: 200, wordCount: 500, revisionId: "current" });
+        callback({ ok: true, status: 200, wordCount: 10800, revisionId: "current" });
         return;
       }
       if (message.aceType === "ace-api-fetch") {
@@ -558,9 +558,9 @@ test("manual session start shows positive catch-up before starting", async () =>
   const state = exports.aceTestState();
   assert.equal(state.state, "catch-up");
   assert.equal(state.activeSession, null);
-  assert.equal(state.catchUpCandidate.netWordsChanged, 500);
-  assert.match(state.widgetHtml, /Net: \+500 words since last session\./);
-  assert.match(state.widgetHtml, /Detected change: .*>\+500 words</);
+  assert.equal(state.catchUpCandidate.netWordsChanged, 495);
+  assert.match(state.widgetHtml, /Net: \+495 words since last session\./);
+  assert.match(state.widgetHtml, /Detected change: .*>\+495 words</);
 });
 
 test("page load does not show catch-up for existing bound surface", async () => {
@@ -652,24 +652,24 @@ test("typing suppression blocks ambient catch-up but explicit start still reconc
   const ambient = exports.aceEvaluateCatchUpCandidate({
     trigger: "auto-start-attempt",
     surface,
-    baseline: baselineFactory(100, { ...surface, project }),
+    baseline: baselineFactory(10800, { ...surface, project }),
     baselineKey: surface.manuscriptSurfaceId,
-    currentSnapshot: snapshotFactory(600),
+    currentSnapshot: snapshotFactory(10805),
     binding: bindingFactory({ ...surface, project }),
     promptSuppressionReason: "typing-suppressed"
   });
   const explicit = exports.aceEvaluateCatchUpCandidate({
     trigger: "pre-session",
     surface,
-    baseline: baselineFactory(100, { ...surface, project }),
+    baseline: baselineFactory(10800, { ...surface, project }),
     baselineKey: surface.manuscriptSurfaceId,
-    currentSnapshot: snapshotFactory(600),
+    currentSnapshot: snapshotFactory(10805),
     binding: bindingFactory({ ...surface, project })
   });
 
   assert.equal(ambient.candidate, null);
   assert.equal(ambient.reason, "typing-suppressed");
-  assert.equal(explicit.candidate.netWordsChanged, 500);
+  assert.equal(explicit.candidate.netWordsChanged, 5);
 });
 
 test("manual sync shows catch-up reconciliation on demand", async () => {
@@ -797,16 +797,16 @@ test("logged full-deletion catch-up advances baseline and cannot repeat", async 
 
 test("initial bind with existing text establishes baseline without catch-up", async () => {
   const surface = surfaceFactory({ documentId: "doc-bind-text", tabId: "tab-a", tabTitle: "Tab A" });
-  const project = projectFactory({ id: "project-bind-text", bookTitle: "Bind Text" });
+  const project = projectFactory({ id: "project-bind-text", bookTitle: "Bind Text", currentWordCount: 10000 });
   const calls = [];
   const { exports, storage } = loadContent({
     topFrame: true,
-    visibleWordCount: 500,
+    visibleWordCount: 10305,
     location: locationForSurface(surface),
     sendMessage(message, callback) {
       calls.push(message);
       if (message.aceType === "ace-google-doc-word-count") {
-        callback({ ok: true, status: 200, wordCount: 500, revisionId: "five-hundred" });
+        callback({ ok: true, status: 200, wordCount: 10305, revisionId: "ten-three-oh-five" });
         return;
       }
       if (message.aceType === "ace-api-fetch") {
@@ -827,15 +827,68 @@ test("initial bind with existing text establishes baseline without catch-up", as
   let state = exports.aceTestState();
   assert.equal(state.state, "prompt");
   assert.equal(state.catchUpCandidate, null);
-  assert.equal(storage.aceDocumentBaselines[surface.manuscriptSurfaceId].endDocumentWordCount, 500);
-  assert.match(state.widgetHtml, /Verified manuscript size: 500 words/);
+  assert.equal(storage.aceDocumentBaselines[surface.manuscriptSurfaceId].endDocumentWordCount, 10305);
+  assert.equal(storage.acePendingSessions, undefined);
+  assert.match(state.widgetHtml, /Verified manuscript size: 10,305 words/);
   const bindingCall = calls.find((message) => (
     message.aceType === "ace-api-fetch"
     && message.path === "/api/extension/document-binding"
     && message.options?.method === "PUT"
   ));
   const bindingPayload = JSON.parse(bindingCall.options.body);
-  assert.equal(bindingPayload.verifiedWordCount, 500);
+  assert.equal(bindingPayload.verifiedWordCount, 10305);
+});
+
+test("active project binding mismatch requires confirmation instead of overwriting", async () => {
+  const originalSurface = surfaceFactory({ documentId: "doc-bound-a", tabId: "tab-a", tabTitle: "Document A" });
+  const currentSurface = surfaceFactory({ documentId: "doc-bound-b", tabId: "tab-a", tabTitle: "Document B" });
+  const project = projectFactory({ id: "project-bound", bookTitle: "Bound Project" });
+  const calls = [];
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    visibleWordCount: 500,
+    location: locationForSurface(currentSurface),
+    initialStorage: {
+      aceDocumentBindings: {
+        [originalSurface.manuscriptSurfaceId]: bindingFactory({ ...originalSurface, project })
+      }
+    },
+    sendMessage(message, callback) {
+      calls.push(message);
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({ ok: true, status: 200, wordCount: 500, revisionId: "current-doc-b" });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        callback({
+          ok: false,
+          status: 409,
+          error: "Project is already bound."
+        });
+      }
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  exports.aceSetTestState({
+    state: "project-picker",
+    currentSurface,
+    projects: [project]
+  });
+
+  await exports.aceBindCurrentSurfaceToProject(project.id);
+
+  const state = exports.aceTestState();
+  const bindingCall = calls.find((message) => (
+    message.aceType === "ace-api-fetch"
+    && message.path === "/api/extension/document-binding"
+    && message.options?.method === "PUT"
+  ));
+  assert.equal(state.state, "prompt");
+  assert.match(state.widgetHtml, /Project is already bound/);
+  assert.equal(Boolean(bindingCall), true);
+  assert.equal(storage.aceDocumentBindings[originalSurface.manuscriptSurfaceId].projectId, project.id);
+  assert.equal(storage.aceDocumentBindings[currentSurface.manuscriptSurfaceId], undefined);
+  assert.equal(storage.aceDocumentBaselines, undefined);
 });
 
 test("initial bind does not trust false visible zero when API sees document words", async () => {
@@ -1064,6 +1117,162 @@ test("active session blocks on tab switch and resumes only on original tab", asy
   assert.equal(exports.aceTestState().state, "active");
 });
 
+test("minimizing an active timer keeps the session running as UI-only state", async () => {
+  const surface = surfaceFactory({ documentId: "doc-minimize", tabId: "tab-a", tabTitle: "Draft" });
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    location: locationForSurface(surface)
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const startedAt = new Date(Date.now() - 61000).toISOString();
+  exports.aceSetTestState({
+    state: "active",
+    activeSession: sessionFactory({
+      ...surface,
+      startedAt,
+      endedAt: "",
+      startDocumentWordCount: 1000,
+      endDocumentWordCount: null
+    })
+  });
+
+  exports.aceRenderActive();
+  const before = exports.aceTestState().activeSession;
+  exports.aceMinimizeWidget();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "active-minimized");
+  assert.equal(state.activeSession.extensionSessionId, before.extensionSessionId);
+  assert.equal(state.activeSession.startedAt, startedAt);
+  assert.equal(state.activeSession.timerDisplayMode, "minimized");
+  assert.equal(state.activeSession.showMinimizedIndicator, true);
+  assert.match(state.widgetClassName, /ace-widget--active-minimized/);
+  assert.match(state.widgetHtml, /Restore timer/);
+  assert.equal(storage.aceActiveSession.extensionSessionId, before.extensionSessionId);
+  assert.equal(storage.aceActiveSession.timerDisplayMode, "minimized");
+});
+
+test("restoring a minimized timer reuses the active session without duplication", async () => {
+  const surface = surfaceFactory({ documentId: "doc-restore", tabId: "tab-a", tabTitle: "Draft" });
+  const project = projectFactory({ id: "project-restore" });
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    location: locationForSurface(surface)
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  const activeSession = sessionFactory({
+    ...surface,
+    project,
+    projectId: project.id,
+    extensionSessionId: "session-restore",
+    startedAt: new Date(Date.now() - 65000).toISOString(),
+    endedAt: "",
+    startDocumentWordCount: 1000,
+    endDocumentWordCount: null,
+    timerDisplayMode: "minimized",
+    showMinimizedIndicator: true,
+    sessionScope: exports.aceCreateSessionScope(surface, {
+      projectId: project.id,
+      chromeTabId: "1"
+    }),
+    chromeTabId: "1"
+  });
+  exports.aceSetTestState({
+    state: "active-minimized",
+    activeSession
+  });
+  exports.aceRenderIdle();
+
+  await exports.aceShowControls();
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "active");
+  assert.equal(state.activeSession.extensionSessionId, "session-restore");
+  assert.equal(state.activeSession.startedAt, activeSession.startedAt);
+  assert.equal(state.activeSession.timerDisplayMode, "expanded");
+  assert.equal(state.activeSession.showMinimizedIndicator, false);
+  assert.equal(state.completedSession, null);
+  assert.equal(storage.acePendingSessions, undefined);
+  assert.match(state.widgetHtml, /End/);
+  assert.match(state.widgetHtml, /Minimize/);
+});
+
+test("minimized active indicator appears only for active minimized sessions", async () => {
+  const surface = surfaceFactory({ documentId: "doc-indicator", tabId: "tab-a", tabTitle: "Draft" });
+  const { exports } = loadContent({
+    topFrame: true,
+    location: locationForSurface(surface)
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  exports.aceSetTestState({ state: "idle", activeSession: null, completedSession: null });
+  exports.aceRenderIdle();
+  assert.doesNotMatch(exports.aceTestState().widgetClassName, /ace-widget--active-minimized/);
+  assert.doesNotMatch(exports.aceTestState().widgetHtml, /ace-minimized-indicator/);
+
+  exports.aceSetTestState({
+    state: "active",
+    activeSession: sessionFactory({
+      ...surface,
+      endedAt: "",
+      endDocumentWordCount: null,
+      timerDisplayMode: "expanded",
+      showMinimizedIndicator: false
+    })
+  });
+  exports.aceRenderActive();
+  assert.doesNotMatch(exports.aceTestState().widgetHtml, /ace-minimized-indicator/);
+
+  exports.aceMinimizeWidget();
+  assert.match(exports.aceTestState().widgetHtml, /ace-minimized-indicator/);
+
+  exports.aceSetTestState({ state: "idle", activeSession: null });
+  exports.aceRenderIdle();
+  assert.doesNotMatch(exports.aceTestState().widgetHtml, /ace-minimized-indicator/);
+});
+
+test("restoring minimized timer on the wrong tab keeps the session blocked", async () => {
+  const tabA = surfaceFactory({ documentId: "doc-min-wrong", tabId: "tab-a", tabTitle: "Tab A" });
+  const tabB = surfaceFactory({ documentId: "doc-min-wrong", tabId: "tab-b", tabTitle: "Tab B" });
+  const project = projectFactory({ id: "project-min-wrong" });
+  const { exports, context } = loadContent({
+    topFrame: true,
+    location: locationForSurface(tabA)
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  exports.aceSetTestState({
+    state: "active-minimized",
+    activeSession: sessionFactory({
+      ...tabA,
+      project,
+      projectId: project.id,
+      extensionSessionId: "session-min-wrong",
+      startedAt: new Date(Date.now() - 60000).toISOString(),
+      endedAt: "",
+      startDocumentWordCount: 1000,
+      endDocumentWordCount: null,
+      timerDisplayMode: "minimized",
+      showMinimizedIndicator: true,
+      sessionScope: exports.aceCreateSessionScope(tabA, {
+        projectId: project.id,
+        chromeTabId: "1"
+      }),
+      chromeTabId: "1"
+    })
+  });
+
+  context.location.hash = locationForSurface(tabB).hash;
+  context.location.href = locationForSurface(tabB).href;
+  await exports.aceShowControls();
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "tab-blocked");
+  assert.equal(state.activeSession.extensionSessionId, "session-min-wrong");
+  assert.equal(state.completedSession, null);
+  assert.match(state.widgetHtml, /Return to "Tab A"|belongs to another Google Docs tab/);
+});
+
 test("same document and same Chrome tab can complete a negative writing session", async () => {
   const surface = surfaceFactory({ documentId: "doc-negative", tabId: "tab-a", tabTitle: "Draft" });
   const project = projectFactory({ id: "project-negative", bookTitle: "Negative Project" });
@@ -1260,7 +1469,7 @@ test("session scope validation reports document and Chrome tab mismatches", () =
 
 test("reload with stored active session shows abandoned-session recovery modal", async () => {
   const surface = surfaceFactory({ documentId: "doc-reload", tabId: "tab-a", tabTitle: "Reload Tab" });
-  const project = projectFactory({ id: "project-reload", bookTitle: "The Black Harbor" });
+  const project = projectFactory({ id: "project-reload", bookTitle: "The Black Harbor", currentWordCount: 60000 });
   const activeSession = sessionFactory({
     ...surface,
     project,
@@ -1302,9 +1511,57 @@ test("reload with stored active session shows abandoned-session recovery modal",
   assert.match(state.widgetHtml, /Discard/);
 });
 
+test("recovery blocks stale start count that conflicts with saved baseline", async () => {
+  const surface = surfaceFactory({ documentId: "doc-stale-recovery", tabId: "tab-a", tabTitle: "Version 7" });
+  const project = projectFactory({ id: "project-stale-recovery", bookTitle: "Hollowfield v7", currentWordCount: 63000 });
+  const staleActiveSession = sessionFactory({
+    ...surface,
+    project,
+    projectId: project.id,
+    extensionSessionId: "session-stale-recovery",
+    startedAt: new Date(Date.now() - 1 * 60000).toISOString(),
+    endedAt: "",
+    startDocumentWordCount: 1081,
+    endDocumentWordCount: null
+  });
+  const { exports } = loadContent({
+    topFrame: true,
+    visibleWordCount: 60240,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceActiveSession: staleActiveSession,
+      aceDocumentBaselines: {
+        [surface.manuscriptSurfaceId]: baselineFactory(63000, { ...surface, project })
+      }
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({ ok: true, status: 200, wordCount: 60240, revisionId: "current-60240" });
+        return;
+      }
+      callback({ ok: true, payload: { project } });
+    }
+  });
+  await new Promise((resolve) => setTimeout(resolve, 900));
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "recovery");
+  assert.equal(state.recoveryCandidate.measurementPending, true);
+  assert.notEqual(state.recoveryCandidate.netWordsChanged, 59159);
+  assert.match(state.recoveryCandidate.currentSnapshot.wordCountDiagnostic, /E-RECOVERY-START-BASELINE-MISMATCH/);
+  assert.doesNotMatch(state.widgetHtml, /\+59159 words/);
+
+  await exports.aceRecoverAbandonedSession();
+
+  const recoveredState = exports.aceTestState();
+  assert.equal(recoveredState.state, "recovery");
+  assert.equal(recoveredState.completedSession, null);
+  assert.match(recoveredState.widgetHtml, /Stored session start count conflicts/);
+});
+
 test("recovering abandoned session syncs once and advances baseline", async () => {
   const surface = surfaceFactory({ documentId: "doc-recover", tabId: "tab-a", tabTitle: "Recover Tab" });
-  const project = projectFactory({ id: "project-recover", bookTitle: "Recover Project" });
+  const project = projectFactory({ id: "project-recover", bookTitle: "Recover Project", currentWordCount: 60000 });
   const abandonedSession = sessionFactory({
     ...surface,
     project,

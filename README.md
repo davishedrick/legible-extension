@@ -54,6 +54,45 @@ Before/after word counting uses the Google Docs API through Chrome Identity. Ses
 
 The extension requests `https://www.googleapis.com/auth/documents.readonly` only to compute start/end word counts. It sends net word change, final count, timing, project ID, manuscript surface metadata, and session metadata to Scriptor, not the document text.
 
+## Automated tests
+
+Install JavaScript test dependencies:
+
+```sh
+npm install
+```
+
+Run the pure extension logic suite:
+
+```sh
+npm test
+```
+
+Run the fake Google Docs browser suite:
+
+```sh
+npx playwright install chromium
+npm run test:e2e
+```
+
+The Playwright suite loads this unpacked extension into Chromium and routes `https://docs.google.com/document/d/*` to `tests/fixtures/fake-google-doc.html`. The fake page simulates only the extension-facing pieces Scriptor needs: document ID, document title, tab ID, current word count, editable document activity, document switching, word-count changes, and multi-tab browser state.
+
+These tests cover fake-doc extension loading, document identity detection, word-count reads, first bind baseline correction, catch-up at intentional session boundaries, active typing suppression, wrong-document session protection, valid negative writing sessions, impossible wrong-document deltas, and tab switching. They intentionally do not automate Google login, real Google Docs, real manuscript content, or Google Docs DOM internals.
+
+On macOS, Chromium may need normal access to browser support/profile paths. If a sandbox blocks `~/Library/Application Support/Google/Chrome for Testing`, rerun `npm run test:e2e` outside that sandbox.
+
+Run the optional real Google Docs smoke tests only when you intentionally want a live-doc check:
+
+```sh
+ENABLE_GOOGLE_DOCS_SMOKE=true \
+GOOGLE_DOCS_SMOKE_URL="https://docs.google.com/document/d/DEDICATED_TEST_DOC_ID/edit" \
+npm run test:e2e:google-docs
+```
+
+Use a dedicated throwaway Google test doc, preferably one that does not require account chooser automation. Do not use private manuscripts. Do not commit real document URLs, storage state, cookies, screenshots, traces, or browser profiles.
+
+The real-doc smoke layer verifies only that the extension loads on a live Google Docs document and exposes an extension-owned document identity/surface signal. It does not automate Google login, bind projects, start or end sessions, assert exact word counts, cover the Phase 2 A-I scenarios, or replace fake-doc regression tests.
+
 ## Test checklist
 
 - Open `https://docs.google.com/document/*` and confirm the small `Idle` widget appears.

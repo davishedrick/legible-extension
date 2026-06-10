@@ -26,6 +26,10 @@
   const ACE_WORD_TOKENIZER_VERSION = "google-docs-like-v3";
   const ACE_IS_TOP_FRAME = window.top === window;
   const ACE_ISSUE_TITLE_WORD_LIMIT = 8;
+  const ACE_FAKE_DOCS_QUERY_PARAM = "scriptorFakeDocs";
+  const ACE_FAKE_DOCS_STORAGE_KEY = "aceFakeDocsApiState";
+  const ACE_RECOVERY_START_BASELINE_TOLERANCE_WORDS = 1000;
+  const ACE_RECOVERY_START_BASELINE_TOLERANCE_RATIO = 0.25;
 
   const ACE_SESSION_STORAGE = {
     pageInstanceId: "ace-page-instance-id",
@@ -277,7 +281,71 @@
     return value === "editing" ? "editing" : "writing";
   }
 
+  function aceFakeDocsHarnessElement() {
+    if (window.location.hostname !== "docs.google.com") {
+      return null;
+    }
+    const params = new URLSearchParams(window.location.search || "");
+    if (params.get(ACE_FAKE_DOCS_QUERY_PARAM) !== "1") {
+      return null;
+    }
+    return document.querySelector('[data-scriptor-fake-doc="true"]');
+  }
+
+  function aceFakeDocsHarnessActive() {
+    return Boolean(aceFakeDocsHarnessElement());
+  }
+
+  function aceFakeDocsNumber(value, fallback = 0) {
+    const parsed = Number(String(value ?? "").replace(/,/g, ""));
+    return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : fallback;
+  }
+
+  function aceFakeDocsMetadata() {
+    const element = aceFakeDocsHarnessElement();
+    if (!element) {
+      return null;
+    }
+    element.setAttribute("data-extension-detected", "true");
+    const documentId = String(element.getAttribute("data-document-id") || "").trim();
+    const tabId = String(element.getAttribute("data-tab-id") || "default").trim() || "default";
+    const tabTitle = String(element.getAttribute("data-document-title") || element.getAttribute("data-tab-title") || "").trim();
+    const wordCountMode = String(element.getAttribute("data-word-count-mode") || "ok").trim();
+    const rawWordCount = element.getAttribute("data-word-count");
+    const wordCount = wordCountMode === "ok" && rawWordCount !== null && rawWordCount !== ""
+      ? aceFakeDocsNumber(rawWordCount, 0)
+      : null;
+    return {
+      documentId,
+      tabId,
+      tabTitle,
+      manuscriptSurfaceId: aceCreateManuscriptSurfaceId(documentId, tabId),
+      wordCount,
+      wordCountMode
+    };
+  }
+
+  function aceFakeDocsPublishState(state) {
+    const element = aceFakeDocsHarnessElement();
+    const project = state?.projects?.[0];
+    if (!element || !project?.project) {
+      return;
+    }
+    element.setAttribute("data-project-current-word-count", String(aceFakeDocsNumber(project.project.currentWordCount, 0)));
+    element.setAttribute(
+      "data-project-starting-word-count",
+      project.project.startingWordCount === null || project.project.startingWordCount === undefined
+        ? ""
+        : String(aceFakeDocsNumber(project.project.startingWordCount, 0))
+    );
+    element.setAttribute("data-session-count", String((project.sessions || []).length));
+  }
+
   function aceExtractDocumentId() {
+    const fakeMetadata = aceFakeDocsMetadata();
+    if (fakeMetadata?.documentId) {
+      return fakeMetadata.documentId;
+    }
     const match = window.location.pathname.match(/\/document\/d\/([^/]+)/);
     return match ? decodeURIComponent(match[1]) : "";
   }
@@ -300,6 +368,14 @@
   }
 
   function aceCurrentGoogleDocTabInfo() {
+    const fakeMetadata = aceFakeDocsMetadata();
+    if (fakeMetadata?.documentId) {
+      return {
+        tabId: aceNormalizeTabId(fakeMetadata.tabId),
+        tabTitle: aceNormalizeTabTitle(fakeMetadata.tabTitle)
+      };
+    }
+
     const currentLocation = window.location || globalThis.location || {};
     const tabParamNames = ["tab", "tabId", "tab_id", "documentTabId"];
     const tabTitleParamNames = ["tabTitle", "tab_title"];
@@ -796,6 +872,293 @@
     return payload;
   }
 
+  function aceFakeDocsProjectSummary(project) {
+    const projectBundle = project?.project || {};
+    return {
+      id: project.id,
+      bookTitle: projectBundle.bookTitle || "Fake Project",
+      manuscriptType: projectBundle.manuscriptType || "Novel",
+      currentWordCount: aceFakeDocsNumber(projectBundle.currentWordCount, 0),
+      startingWordCount: projectBundle.startingWordCount ?? null,
+      baselineEstablished: Boolean(projectBundle.baselineEstablished),
+      startingWordCountSource: projectBundle.startingWordCountSource || "",
+      startingWordCountEstablishedAt: projectBundle.startingWordCountEstablishedAt || "",
+      status: project.status || "active"
+    };
+  }
+
+  function aceFakeDocsInitialProject(metadata) {
+    const element = aceFakeDocsHarnessElement();
+    const projectId = element?.getAttribute("data-project-id") || "fake-project-a";
+    const title = element?.getAttribute("data-project-title") || "Fake Project A";
+    const currentWordCount = aceFakeDocsNumber(element?.getAttribute("data-project-estimate"), 10000);
+    return {
+      id: projectId,
+      status: "active",
+      project: {
+        bookTitle: title,
+        manuscriptType: "Novel",
+        currentWordCount,
+        startingWordCount: null,
+        baselineEstablished: false,
+        startingWordCountSource: "provisional",
+        startingWordCountEstablishedAt: ""
+      },
+      sessions: [],
+      issues: []
+    };
+  }
+
+  async function aceFakeDocsApiState() {
+    const stored = await aceStorageGet(ACE_FAKE_DOCS_STORAGE_KEY);
+    const existing = stored[ACE_FAKE_DOCS_STORAGE_KEY];
+    if (existing?.projects?.length) {
+      aceFakeDocsPublishState(existing);
+      return existing;
+    }
+    const metadata = aceFakeDocsMetadata() || {};
+    const initialState = {
+      projects: [aceFakeDocsInitialProject(metadata)],
+      bindings: {},
+      issues: []
+    };
+    await aceStorageSet({ [ACE_FAKE_DOCS_STORAGE_KEY]: initialState });
+    aceFakeDocsPublishState(initialState);
+    return initialState;
+  }
+
+  async function aceSaveFakeDocsApiState(state) {
+    await aceStorageSet({ [ACE_FAKE_DOCS_STORAGE_KEY]: state });
+    aceFakeDocsPublishState(state);
+  }
+
+  function aceFakeDocsFindProject(state, projectId) {
+    return (state.projects || []).find(function (project) {
+      return String(project.id) === String(projectId);
+    }) || null;
+  }
+
+  function aceFakeDocsBindingRows(state) {
+    return (state.projects || []).map(function (project) {
+      const bindingEntry = Object.values(state.bindings || {}).find(function (binding) {
+        return binding?.projectId === project.id;
+      });
+      return {
+        project: aceFakeDocsProjectSummary(project),
+        isBound: Boolean(bindingEntry),
+        bindingStatus: bindingEntry ? "active" : "unbound",
+        staleReason: "",
+        binding: bindingEntry || null,
+        deletedBinding: null
+      };
+    });
+  }
+
+  function aceFakeDocsParseBody(options = {}) {
+    try {
+      return JSON.parse(options.body || "{}");
+    } catch (_error) {
+      return {};
+    }
+  }
+
+  function aceFakeDocsSurfaceFromPayload(payload) {
+    return aceSurfaceFromParts({
+      documentId: payload.documentId,
+      tabId: payload.tabId,
+      tabTitle: payload.tabTitle,
+      manuscriptSurfaceId: payload.manuscriptSurfaceId
+    });
+  }
+
+  async function aceFakeDocsGoogleDocMessage(aceType, payload = {}) {
+    const metadata = aceFakeDocsMetadata();
+    if (!metadata?.documentId) {
+      return {
+        ok: false,
+        wordCount: null,
+        error: "Fake Google Docs document identity is missing."
+      };
+    }
+
+    if (payload.documentId && payload.documentId !== metadata.documentId) {
+      return {
+        ok: false,
+        status: 404,
+        wordCount: null,
+        error: "E-FAKE-DOC-MISMATCH: Fake document identity changed."
+      };
+    }
+
+    if (metadata.wordCountMode !== "ok" || !Number.isFinite(Number(metadata.wordCount))) {
+      return {
+        ok: false,
+        status: metadata.wordCountMode === "failure" ? 503 : 422,
+        wordCount: null,
+        apiWordCount: null,
+        visibleWordCount: null,
+        error: metadata.wordCountMode === "failure"
+          ? "E-FAKE-WORD-COUNT-FAILED: Fake word count read failed."
+          : "E-FAKE-WORD-COUNT-MISSING: Fake word count is unavailable."
+      };
+    }
+
+    const response = {
+      ok: true,
+      status: 200,
+      method: "fake-google-doc",
+      revisionId: `fake-${metadata.documentId}-${metadata.wordCount}`,
+      wordCount: metadata.wordCount,
+      apiWordCount: metadata.wordCount,
+      visibleWordCount: metadata.wordCount,
+      wordCountTokenizerVersion: "fake-google-docs"
+    };
+
+    if (aceType === ACE_GOOGLE_DOC_START_SNAPSHOT_MESSAGE) {
+      await aceStorageSet({
+        [aceSnapshotStorageKey(payload.extensionSessionId)]: {
+          documentId: metadata.documentId,
+          revisionId: response.revisionId,
+          wordCount: metadata.wordCount,
+          wordCountTokenizerVersion: response.wordCountTokenizerVersion,
+          createdAt: new Date().toISOString(),
+          source: "fake-google-doc"
+        }
+      });
+      return response;
+    }
+
+    if (aceType === ACE_GOOGLE_DOC_NET_COUNT_MESSAGE) {
+      const stored = await aceStorageGet(aceSnapshotStorageKey(payload.extensionSessionId));
+      const startSnapshot = stored[aceSnapshotStorageKey(payload.extensionSessionId)] || {};
+      const startWordCount = aceFakeDocsNumber(startSnapshot.wordCount, 0);
+      return {
+        ...response,
+        startWordCount,
+        netWordsChanged: metadata.wordCount - startWordCount
+      };
+    }
+
+    return response;
+  }
+
+  function aceFakeDocsEstablishProjectBaseline(project, wordCount, source = "fake-google-doc") {
+    const projectBundle = project?.project;
+    if (!projectBundle) {
+      return;
+    }
+    const verifiedWordCount = aceFakeDocsNumber(wordCount, 0);
+    if (!projectBundle.baselineEstablished && project.sessions.length === 0) {
+      projectBundle.startingWordCount = verifiedWordCount;
+      projectBundle.startingWordCountSource = source;
+      projectBundle.startingWordCountEstablishedAt = new Date().toISOString();
+      projectBundle.baselineEstablished = true;
+    }
+    projectBundle.currentWordCount = verifiedWordCount;
+  }
+
+  async function aceFakeDocsApiFetch(path, options = {}) {
+    const state = await aceFakeDocsApiState();
+    const method = String(options.method || "GET").toUpperCase();
+    const parsedUrl = new URL(path, window.location.origin);
+    const basePath = parsedUrl.pathname;
+
+    if (method === "GET" && basePath === "/api/projects") {
+      return {
+        projects: state.projects.map(function (project) {
+          return aceFakeDocsProjectSummary(project);
+        })
+      };
+    }
+
+    if (method === "GET" && basePath === "/api/extension/projects") {
+      return { projects: aceFakeDocsBindingRows(state) };
+    }
+
+    if (basePath === "/api/extension/document-binding") {
+      if (method === "GET") {
+        const documentId = parsedUrl.searchParams.get("documentId") || "";
+        const manuscriptSurfaceId = parsedUrl.searchParams.get("manuscriptSurfaceId") || aceCreateManuscriptSurfaceId(documentId, parsedUrl.searchParams.get("tabId"));
+        const binding = state.bindings[manuscriptSurfaceId] || null;
+        const project = binding ? aceFakeDocsFindProject(state, binding.projectId) : null;
+        return {
+          documentId,
+          manuscriptSurfaceId,
+          project: project ? aceFakeDocsProjectSummary(project) : null
+        };
+      }
+
+      if (method === "PUT") {
+        const payload = aceFakeDocsParseBody(options);
+        const surface = aceFakeDocsSurfaceFromPayload(payload);
+        const project = aceFakeDocsFindProject(state, payload.projectId);
+        if (!surface.documentId || !surface.manuscriptSurfaceId) {
+          throw new Error("documentId is required.");
+        }
+        if (!project) {
+          throw new Error("Project not found.");
+        }
+        const existingForSurface = state.bindings[surface.manuscriptSurfaceId];
+        if (existingForSurface && existingForSurface.projectId !== project.id) {
+          throw new Error("This manuscript is already bound. Unbind first.");
+        }
+        const existingForProject = Object.entries(state.bindings).find(function ([key, binding]) {
+          return key !== surface.manuscriptSurfaceId && binding?.projectId === project.id;
+        });
+        if (existingForProject) {
+          throw new Error("Project is already bound.");
+        }
+        state.bindings[surface.manuscriptSurfaceId] = {
+          ...surface,
+          projectId: project.id,
+          project: aceFakeDocsProjectSummary(project),
+          updatedAt: new Date().toISOString()
+        };
+        if (Number.isFinite(Number(payload.verifiedWordCount))) {
+          aceFakeDocsEstablishProjectBaseline(
+            project,
+            payload.verifiedWordCount,
+            payload.verifiedWordCountSource || "fake-google-doc"
+          );
+        }
+        await aceSaveFakeDocsApiState(state);
+        return { documentId: surface.documentId, manuscriptSurfaceId: surface.manuscriptSurfaceId, project: aceFakeDocsProjectSummary(project) };
+      }
+    }
+
+    if (method === "POST" && basePath === "/api/extension/sessions") {
+      const payload = aceFakeDocsParseBody(options);
+      const surface = aceFakeDocsSurfaceFromPayload(payload);
+      const binding = state.bindings[surface.manuscriptSurfaceId];
+      if (!binding || binding.projectId !== payload.projectId) {
+        throw new Error("Document is not bound to this project.");
+      }
+      const project = aceFakeDocsFindProject(state, payload.projectId);
+      if (!project) {
+        throw new Error("Project not found.");
+      }
+      const duplicate = project.sessions.some(function (session) {
+        return session.extensionSessionId === payload.extensionSessionId;
+      });
+      const session = {
+        ...payload,
+        id: payload.extensionSessionId || `fake-session-${Date.now()}`,
+        type: payload.sessionType === "editing" ? "edit" : "write",
+        source: payload.source || "chrome-extension"
+      };
+      if (!duplicate) {
+        project.sessions.push(session);
+      }
+      if (Number.isFinite(Number(payload.endDocumentWordCount))) {
+        project.project.currentWordCount = aceFakeDocsNumber(payload.endDocumentWordCount, 0);
+      }
+      await aceSaveFakeDocsApiState(state);
+      return { session, project: aceFakeDocsProjectSummary(project), duplicate };
+    }
+
+    throw new Error(`Fake Scriptor API route not implemented: ${method} ${basePath}`);
+  }
+
   async function aceApiFetchViaRuntime(path, options) {
     return new Promise(function (resolve, reject) {
       const runtime = aceChromeRuntime();
@@ -826,6 +1189,10 @@
   }
 
   async function aceApiFetch(path, options) {
+    if (aceFakeDocsHarnessActive()) {
+      return aceFakeDocsApiFetch(path, options);
+    }
+
     let response = {};
     try {
       response = await aceApiFetchViaRuntime(path, options);
@@ -1912,6 +2279,10 @@
   }
 
   async function aceGoogleDocMessage(aceType, payload) {
+    if (aceFakeDocsHarnessActive()) {
+      return aceFakeDocsGoogleDocMessage(aceType, payload);
+    }
+
     const apiStartedAt = aceNowMs();
     const response = await new Promise(function (resolve) {
       const runtime = aceChromeRuntime();
@@ -2732,7 +3103,9 @@
     const settleStartedAt = aceNowMs();
     const settleDelayMs = Number.isFinite(Number(options.settleDelayMs))
       ? Math.max(0, Number(options.settleDelayMs))
-      : ACE_GOOGLE_DOC_SETTLE_DELAY_MS;
+      : aceFakeDocsHarnessActive()
+        ? 0
+        : ACE_GOOGLE_DOC_SETTLE_DELAY_MS;
     if (settleDelayMs > 0) {
       await aceDelay(settleDelayMs);
     }
@@ -2757,7 +3130,11 @@
 
     const stableVisible = await aceStableVisibleGoogleDocWordCount({
       timeoutMs: Number.isFinite(Number(options.visibleTimeoutMs)) ? Number(options.visibleTimeoutMs) : ACE_VISIBLE_STABLE_TIMEOUT_MS,
-      delayMs: Number.isFinite(Number(options.visibleDelayMs)) ? Number(options.visibleDelayMs) : ACE_VISIBLE_STABLE_DELAY_MS,
+      delayMs: Number.isFinite(Number(options.visibleDelayMs))
+        ? Number(options.visibleDelayMs)
+        : aceFakeDocsHarnessActive()
+          ? 0
+          : ACE_VISIBLE_STABLE_DELAY_MS,
       minStableReads: 2,
       ignoreZero: Boolean(options.ignoreZero),
       readVisibleCount: options.readVisibleCount,
@@ -3114,7 +3491,9 @@
     const settleStartedAt = aceNowMs();
     const settleDelayMs = Number.isFinite(Number(options.settleDelayMs))
       ? Math.max(0, Number(options.settleDelayMs))
-      : ACE_GOOGLE_DOC_SETTLE_DELAY_MS;
+      : aceFakeDocsHarnessActive()
+        ? 0
+        : ACE_GOOGLE_DOC_SETTLE_DELAY_MS;
     if (settleDelayMs > 0) {
       await aceDelay(settleDelayMs);
     }
@@ -3135,7 +3514,11 @@
 
     const stableVisible = await aceStableVisibleGoogleDocWordCount({
       timeoutMs: Number.isFinite(Number(options.visibleTimeoutMs)) ? Number(options.visibleTimeoutMs) : ACE_REFRESH_VISIBLE_STABLE_TIMEOUT_MS,
-      delayMs: Number.isFinite(Number(options.visibleDelayMs)) ? Number(options.visibleDelayMs) : ACE_VISIBLE_STABLE_DELAY_MS,
+      delayMs: Number.isFinite(Number(options.visibleDelayMs))
+        ? Number(options.visibleDelayMs)
+        : aceFakeDocsHarnessActive()
+          ? 0
+          : ACE_VISIBLE_STABLE_DELAY_MS,
       minStableReads: 2,
       ignoreZero: Boolean(options.ignoreZero),
       readVisibleCount: options.readVisibleCount,
@@ -3538,6 +3921,22 @@
     acePromptError = "";
   }
 
+  function acePublishWidgetSmokeState() {
+    if (!ACE_IS_TOP_FRAME || !aceWidget) {
+      return;
+    }
+
+    const surface = aceCurrentSurface || aceCurrentManuscriptSurface();
+    const isGoogleDocsDocument = window.location.hostname === "docs.google.com"
+      && window.location.pathname.startsWith("/document/");
+    aceWidget.setAttribute("data-ace-extension-ready", "true");
+    aceWidget.setAttribute("data-ace-supported-surface", isGoogleDocsDocument ? "google-docs" : "");
+    aceWidget.setAttribute("data-ace-document-id", surface?.documentId || "");
+    aceWidget.setAttribute("data-ace-tab-id", surface?.tabId || "");
+    aceWidget.setAttribute("data-ace-manuscript-surface-id", surface?.manuscriptSurfaceId || "");
+    aceWidget.setAttribute("data-ace-widget-state", (aceWidget.className.match(/ace-widget--([a-z-]+)/) || [])[1] || "");
+  }
+
   function aceRenderLoading(message, detail) {
     const detailCopy = detail
       ? `<div class="ace-loading-detail">${aceEscapeHtml(detail)}</div>`
@@ -3555,13 +3954,18 @@
   }
 
   function aceRenderIdle() {
-    aceWidget.className = "ace-widget ace-widget--idle";
+    const minimizedActive = Boolean(aceActiveSession && aceActiveSession.timerDisplayMode === "minimized");
+    const indicator = minimizedActive
+      ? '<span class="ace-minimized-indicator" aria-hidden="true"></span><span class="ace-sr-only">Active session minimized</span>'
+      : "";
+    aceWidget.className = `ace-widget ace-widget--idle${minimizedActive ? " ace-widget--active-minimized" : ""}`;
     aceWidget.innerHTML = `
-      <button class="ace-icon-button" type="button" data-ace-action="show-controls" aria-label="Open Scriptor session controls">
+      <button class="ace-icon-button" type="button" data-ace-action="show-controls" aria-label="${minimizedActive ? "Restore timer" : "Open Scriptor session controls"}">
         <svg class="ace-pencil-icon" viewBox="0 0 24 24" aria-hidden="true">
           <path d="M4 20h4.2L19.4 8.8a2.1 2.1 0 0 0 0-3L18.2 4.6a2.1 2.1 0 0 0-3 0L4 15.8V20z"></path>
           <path d="M13.8 6 18 10.2"></path>
         </svg>
+        ${indicator}
       </button>
     `;
     aceApplyWidgetPosition();
@@ -3910,9 +4314,14 @@
       : "";
     const tabCopy = `<div class="ace-project-copy">Current tab: ${aceEscapeHtml(aceActiveSession.tabTitle || aceActiveSession.manuscriptSurfaceLabel || "Current manuscript")}</div>`;
 
+    aceActiveSession = {
+      ...aceActiveSession,
+      timerDisplayMode: "expanded",
+      showMinimizedIndicator: false
+    };
     aceWidget.className = "ace-widget ace-widget--active";
     aceWidget.innerHTML = `
-      ${aceCloseButtonHtml()}
+      ${aceCloseButtonHtml("Minimize timer")}
       ${acePanelHeaderHtml("Session", label)}
       <div class="ace-session-metric">
         <span class="ace-session-type">${label}</span>
@@ -3923,6 +4332,7 @@
       ${tabCopy}
       <div class="ace-actions">
         <button class="ace-button ace-button--end" type="button" data-ace-action="end">End</button>
+        <button class="ace-button" type="button" data-ace-action="minimize-timer">Minimize</button>
         <button class="ace-button" type="button" data-ace-action="show-issue-form">Issue</button>
         <button class="ace-button" type="button" data-ace-action="open">Open project</button>
       </div>
@@ -4334,8 +4744,8 @@
     return text.length > maxLength ? `${text.slice(0, maxLength - 3)}...` : text;
   }
 
-  function aceCloseButtonHtml() {
-    return '<button class="ace-close-button" type="button" data-ace-action="close-popup" aria-label="Close Scriptor controls">&times;</button>';
+  function aceCloseButtonHtml(label = "Close Scriptor controls") {
+    return `<button class="ace-close-button" type="button" data-ace-action="close-popup" aria-label="${aceEscapeHtml(label)}">&times;</button>`;
   }
 
   function acePanelHeaderHtml(title, meta) {
@@ -4603,6 +5013,8 @@
     }
 
     const sessionChromeTabId = aceSessionChromeTabId(aceActiveSession);
+    const sessionSurface = aceSessionManuscriptSurface(aceActiveSession);
+    const currentSurface = aceCurrentManuscriptSurface();
     const currentScope = await aceGetCurrentDocumentScope(aceActiveSession.projectId || "");
     const currentChromeTabId = aceNormalizeChromeTabId(currentScope.chromeTabId);
 
@@ -4615,6 +5027,17 @@
       aceSyncMessage = response?.error || "Unable to open session ending workflow.";
       aceRenderTabChangedBlock(aceCurrentManuscriptSurface());
       return { ok: false, reason: "remote-end-failed", error: response?.error || "" };
+    }
+
+    if (
+      sessionSurface.documentId
+      && currentSurface.documentId
+      && sessionSurface.documentId !== currentSurface.documentId
+    ) {
+      aceSyncStatus = "pending";
+      aceSyncMessage = "Return to the original document before ending this session.";
+      aceRenderTabChangedBlock(currentSurface);
+      return { ok: false, reason: "wrong-document-context" };
     }
 
     const returned = await aceReturnToActiveSessionTab({ trigger: "session-pause-end" });
@@ -4764,6 +5187,17 @@
     }
 
     if (aceActiveSession) {
+      const currentSurface = aceCurrentManuscriptSurface();
+      if (aceSessionSurfaceMismatch(aceActiveSession, currentSurface) || !aceSurfaceConfidence(currentSurface)) {
+        await aceBlockActiveSessionForTabSwitch(currentSurface);
+        return;
+      }
+      aceActiveSession = {
+        ...aceActiveSession,
+        timerDisplayMode: "expanded",
+        showMinimizedIndicator: false
+      };
+      await acePersistActiveSession();
       aceState = "active";
       aceStartTimer();
       return;
@@ -5375,8 +5809,11 @@
     promptSuppressionReason = ""
   } = {}) {
     const baselineWordCount = Math.max(0, Number(baseline?.endDocumentWordCount) || 0);
-    const currentWordCount = Math.max(0, Number(currentSnapshot?.wordCount) || 0);
-    const netWordsChanged = aceCalculateNetWordDelta(baselineWordCount, currentWordCount);
+    const hasCurrentWordCount = Boolean(currentSnapshot?.ok && Number.isFinite(Number(currentSnapshot.wordCount)));
+    const currentWordCount = hasCurrentWordCount ? Math.max(0, Number(currentSnapshot.wordCount)) : null;
+    const netWordsChanged = Number.isFinite(currentWordCount)
+      ? aceCalculateNetWordDelta(baselineWordCount, currentWordCount)
+      : 0;
     let reason = "";
 
     if (!surface.documentId || !surface.manuscriptSurfaceId) {
@@ -5473,13 +5910,22 @@
       aceLogCatchUpDecision(trace);
       return { candidate: null, error: "", reason: "no-binding" };
     }
-    const currentSnapshot = await aceGoogleDocWordCountAfterSettle(documentId, baseline, { trigger });
-    const currentWordCount = Math.max(0, Number(currentSnapshot?.wordCount) || 0);
-    const baselineWordCount = Math.max(0, Number(baseline?.endDocumentWordCount) || 0);
-    const pendingSession = await acePendingSessionForCatchUpChange(surface, baselineWordCount, currentWordCount);
-    const completedSession = aceSessionCoversCatchUpChange(aceCompletedSession, surface, baselineWordCount, currentWordCount)
-      ? aceCompletedSession
+    const currentSnapshot = await aceGoogleDocWordCountAfterSettle(documentId, baseline, {
+      trigger,
+      verifyZeroWithApi: true,
+      apiSurfaceTrusted: true
+    });
+    const currentWordCount = currentSnapshot?.ok && Number.isFinite(Number(currentSnapshot.wordCount))
+      ? Math.max(0, Number(currentSnapshot.wordCount))
       : null;
+    const baselineWordCount = Math.max(0, Number(baseline?.endDocumentWordCount) || 0);
+    const pendingSession = Number.isFinite(currentWordCount)
+      ? await acePendingSessionForCatchUpChange(surface, baselineWordCount, currentWordCount)
+      : null;
+    const completedSession = Number.isFinite(currentWordCount)
+      && aceSessionCoversCatchUpChange(aceCompletedSession, surface, baselineWordCount, currentWordCount)
+        ? aceCompletedSession
+        : null;
     const catchUpBaseline = {
       ...baseline,
       projectId: binding.projectId,
@@ -5602,6 +6048,11 @@
 
   function aceMinimizeWidget() {
     if (aceActiveSession) {
+      aceActiveSession = {
+        ...aceActiveSession,
+        timerDisplayMode: "minimized",
+        showMinimizedIndicator: true
+      };
       aceState = "active-minimized";
       aceClearTimer();
       aceRunAsync(acePersistActiveSession(), "persist minimized session");
@@ -5656,6 +6107,8 @@
       wordsAdded: 0,
       wordsRemoved: 0,
       netWordsChanged: 0,
+      timerDisplayMode: "expanded",
+      showMinimizedIndicator: false,
       hadDocumentActivity: Boolean(hadDocumentActivity),
       startDocumentWordCount: Number.isFinite(startSnapshot.wordCount)
         ? startSnapshot.wordCount
@@ -5948,6 +6401,48 @@
     const startDocumentWordCount = Number.isFinite(Number(abandonedSession.startDocumentWordCount))
       ? Math.max(0, Number(abandonedSession.startDocumentWordCount))
       : null;
+    const savedBaseline = await aceGetDocumentBaseline(aceSessionManuscriptSurface(abandonedSession));
+    const savedBaselineWordCount = Number(savedBaseline?.endDocumentWordCount);
+    const projectWordCount = Number(abandonedSession?.project?.currentWordCount);
+    const referenceWordCount = Number.isFinite(savedBaselineWordCount)
+      ? Math.max(0, savedBaselineWordCount)
+      : Number.isFinite(projectWordCount)
+        ? Math.max(0, projectWordCount)
+        : null;
+    const referenceSource = Number.isFinite(savedBaselineWordCount)
+      ? "saved-baseline"
+      : Number.isFinite(projectWordCount)
+        ? "project-current-word-count"
+        : "";
+    const mismatchTolerance = Number.isFinite(referenceWordCount)
+      ? Math.max(
+          ACE_RECOVERY_START_BASELINE_TOLERANCE_WORDS,
+          Math.round(referenceWordCount * ACE_RECOVERY_START_BASELINE_TOLERANCE_RATIO)
+        )
+      : null;
+    if (
+      Number.isFinite(startDocumentWordCount)
+      && Number.isFinite(referenceWordCount)
+      && Math.abs(startDocumentWordCount - referenceWordCount) > mismatchTolerance
+    ) {
+      const currentSnapshot = {
+        ok: false,
+        wordCount: null,
+        currentCountSource: "recovery-start-baseline-mismatch",
+        method: "recovery-start-baseline-mismatch",
+        error: "Stored session start count conflicts with the saved document baseline.",
+        wordCountDiagnostic: `E-RECOVERY-START-BASELINE-MISMATCH: stored session start ${startDocumentWordCount}; ${referenceSource} ${referenceWordCount}; tolerance ${mismatchTolerance}.`
+      };
+      return {
+        abandonedSession,
+        currentSnapshot,
+        startDocumentWordCount,
+        endDocumentWordCount: null,
+        netWordsChanged: null,
+        elapsedMs: aceElapsedMsForSession(abandonedSession),
+        measurementPending: true
+      };
+    }
     const baseline = {
       ...abandonedSession,
       endDocumentWordCount: Number.isFinite(startDocumentWordCount) ? startDocumentWordCount : 0
@@ -5974,6 +6469,10 @@
       elapsedMs: aceElapsedMsForSession(abandonedSession),
       measurementPending: !Number.isFinite(endDocumentWordCount)
     };
+  }
+
+  function aceRecoveryCandidateHasStartBaselineMismatch(candidate) {
+    return candidate?.currentSnapshot?.currentCountSource === "recovery-start-baseline-mismatch";
   }
 
   async function aceRestorePendingSessionForCurrentDocument() {
@@ -6323,6 +6822,13 @@
         return;
       }
       aceRecoveryCandidate = candidate;
+    }
+    if (aceRecoveryCandidateHasStartBaselineMismatch(candidate)) {
+      aceState = "recovery";
+      aceSyncStatus = "pending";
+      aceSyncMessage = candidate.currentSnapshot?.error || "Stored session start count conflicts with the saved document baseline.";
+      aceRenderRecoveryModal();
+      return;
     }
 
     aceCompletedSession = aceBuildRecoveredCompletedSession(candidate);
@@ -7218,6 +7724,8 @@
       return;
     }
 
+    acePublishWidgetSmokeState();
+
     if (!ACE_POSITIONS.includes(aceWidgetPosition)) {
       aceWidgetPosition = ACE_DEFAULT_POSITION;
     }
@@ -7402,6 +7910,8 @@
       aceRunAsync(aceCopyIssueQuote(button.getAttribute("data-ace-issue-id"), true), "copy quote");
     } else if (action === "close-popup") {
       aceMinimizeWidget();
+    } else if (action === "minimize-timer") {
+      aceMinimizeWidget();
     } else if (action === "add-catch-up") {
       aceRunAsync(aceSyncCatchUpSession(), "sync catch-up session");
     } else if (action === "skip-catch-up") {
@@ -7517,7 +8027,8 @@
           pendingDeletedBindingRebind: acePendingDeletedBindingRebind,
           currentIssues: aceCurrentIssues,
           selectedProject: aceSelectedProject,
-          widgetHtml: aceWidget?.innerHTML || ""
+          widgetHtml: aceWidget?.innerHTML || "",
+          widgetClassName: aceWidget?.className || ""
         };
       },
       aceSetTestState: function (updates = {}) {
@@ -7612,6 +8123,10 @@
       aceRefreshStateForSurfaceSwitch,
       aceHandleSurfaceLifecycleChange,
       aceCheckCatchUpForCurrentSurface,
+      aceRenderIdle,
+      aceRenderActive,
+      aceMinimizeWidget,
+      aceShowControls,
       aceBlockActiveSessionForTabSwitch,
       aceResumeActiveSessionForSurface,
       aceReturnToActiveSessionTab,

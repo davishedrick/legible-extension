@@ -418,6 +418,28 @@ test("catch-up decision skips visible-unavailable API negative result", () => {
   assert.match(diagnostic, /visible end unavailable/);
 });
 
+test("catch-up decision does not coerce unknown current count to zero", () => {
+  const { exports } = loadContent();
+  const result = evaluateCatchUp(exports, {
+    baseline: catchUpBaseline(1114),
+    currentSnapshot: catchUpSnapshot(null, {
+      ok: false,
+      skipCatchUp: true,
+      wordCount: null,
+      apiWordCount: null,
+      visibleWordCount: null,
+      currentCountSource: "none",
+      currentCountTrusted: false,
+      error: "word count unavailable"
+    })
+  });
+
+  assert.equal(result.candidate, null);
+  assert.equal(result.reason, "current-count-diagnostic-only");
+  assert.equal(result.trace.decision.netWordsChanged, 0);
+  assert.equal(result.trace.currentCounts.selectedVisibleCount, null);
+});
+
 test("catch-up decision trusts stable visible count over API mismatch", () => {
   const { exports } = loadContent();
   const result = evaluateCatchUp(exports, {
@@ -1336,6 +1358,112 @@ test("binding baseline rejects false visible zero when API returns positive coun
   assert.equal(result.currentCountSource, "google-docs-api");
   assert.equal(result.method, "google-docs-api");
   assert.match(result.wordCountDiagnostic, /W-VISIBLE-ZERO-API-POSITIVE/);
+});
+
+test("catch-up check rejects false visible zero when API returns unchanged positive count", async () => {
+  const { exports } = loadContent();
+  const reads = [0, 0];
+
+  const result = await exports.aceGoogleDocWordCountAfterSettle(
+    "doc-test",
+    { endDocumentWordCount: 1114 },
+    {
+      trigger: "manual-sync",
+      verifyZeroWithApi: true,
+      apiSurfaceTrusted: true,
+      settleDelayMs: 0,
+      visibleDelayMs: 0,
+      visibleTimeoutMs: 100,
+      apiTimeoutMs: 100,
+      readVisibleCount: async () => {
+        const count = reads.shift();
+        return {
+          count,
+          candidates: [{ count, snippet: `${count} words` }],
+          selectedCandidate: { count, snippet: `${count} words` }
+        };
+      },
+      apiCall: async () => ({ ok: true, wordCount: 1114, revisionId: "api-revision" })
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.wordCount, 1114);
+  assert.equal(result.visibleWordCount, 0);
+  assert.equal(result.netWordsChanged, 0);
+  assert.equal(result.currentCountSource, "google-docs-api");
+  assert.match(result.wordCountDiagnostic, /W-VISIBLE-ZERO-API-POSITIVE/);
+});
+
+test("catch-up check rejects false visible zero when API returns changed positive count", async () => {
+  const { exports } = loadContent();
+  const reads = [0, 0];
+
+  const result = await exports.aceGoogleDocWordCountAfterSettle(
+    "doc-test",
+    { endDocumentWordCount: 60284 },
+    {
+      trigger: "manual-sync",
+      verifyZeroWithApi: true,
+      apiSurfaceTrusted: true,
+      settleDelayMs: 0,
+      visibleDelayMs: 0,
+      visibleTimeoutMs: 100,
+      apiTimeoutMs: 100,
+      readVisibleCount: async () => {
+        const count = reads.shift();
+        return {
+          count,
+          candidates: [{ count, snippet: `${count} words` }],
+          selectedCandidate: { count, snippet: `${count} words` }
+        };
+      },
+      apiCall: async () => ({ ok: true, wordCount: 60276, revisionId: "api-revision" })
+    }
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.wordCount, 60276);
+  assert.equal(result.visibleWordCount, 0);
+  assert.equal(result.netWordsChanged, -8);
+  assert.equal(result.currentCountSource, "google-docs-api");
+  assert.match(result.wordCountDiagnostic, /W-VISIBLE-ZERO-API-POSITIVE/);
+  assert.doesNotMatch(result.wordCountDiagnostic, /net -60284/);
+});
+
+test("catch-up check fails safely when visible zero cannot be verified", async () => {
+  const { exports } = loadContent();
+  const reads = [0, 0];
+
+  const result = await exports.aceGoogleDocWordCountAfterSettle(
+    "doc-test",
+    { endDocumentWordCount: 1114 },
+    {
+      trigger: "manual-sync",
+      verifyZeroWithApi: true,
+      apiSurfaceTrusted: true,
+      settleDelayMs: 0,
+      visibleDelayMs: 0,
+      visibleTimeoutMs: 100,
+      apiTimeoutMs: 100,
+      readVisibleCount: async () => {
+        const count = reads.shift();
+        return {
+          count,
+          candidates: [{ count, snippet: `${count} words` }],
+          selectedCandidate: { count, snippet: `${count} words` }
+        };
+      },
+      apiCall: async () => ({ ok: false, wordCount: null, error: "api unavailable" })
+    }
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.wordCount, null);
+  assert.equal(result.visibleWordCount, 0);
+  assert.equal(result.netWordsChanged, 0);
+  assert.equal(result.currentCountTrusted, false);
+  assert.match(result.error, /E-VISIBLE-ZERO-UNVERIFIED/);
 });
 
 test("binding baseline does not accept visible zero without API confirmation", async () => {
