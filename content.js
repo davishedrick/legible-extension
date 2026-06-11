@@ -309,7 +309,8 @@
     element.setAttribute("data-extension-detected", "true");
     const documentId = String(element.getAttribute("data-document-id") || "").trim();
     const tabId = String(element.getAttribute("data-tab-id") || "default").trim() || "default";
-    const tabTitle = String(element.getAttribute("data-document-title") || element.getAttribute("data-tab-title") || "").trim();
+    const documentTitle = String(element.getAttribute("data-document-title") || "").trim();
+    const tabTitle = String(element.getAttribute("data-tab-title") || documentTitle || "").trim();
     const wordCountMode = String(element.getAttribute("data-word-count-mode") || "ok").trim();
     const rawWordCount = element.getAttribute("data-word-count");
     const wordCount = wordCountMode === "ok" && rawWordCount !== null && rawWordCount !== ""
@@ -317,6 +318,7 @@
       : null;
     return {
       documentId,
+      documentTitle,
       tabId,
       tabTitle,
       manuscriptSurfaceId: aceCreateManuscriptSurfaceId(documentId, tabId),
@@ -359,6 +361,13 @@
     return String(tabTitle || "").replace(/\s+/g, " ").trim();
   }
 
+  function aceNormalizeDocumentTitle(documentTitle) {
+    return String(documentTitle || "")
+      .replace(/\s+-\s+Google Docs\s*$/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function aceCreateManuscriptSurfaceId(documentId, tabId) {
     const normalizedDocumentId = String(documentId || "").trim();
     if (!normalizedDocumentId) {
@@ -371,6 +380,7 @@
     const fakeMetadata = aceFakeDocsMetadata();
     if (fakeMetadata?.documentId) {
       return {
+        documentTitle: aceNormalizeDocumentTitle(fakeMetadata.documentTitle),
         tabId: aceNormalizeTabId(fakeMetadata.tabId),
         tabTitle: aceNormalizeTabTitle(fakeMetadata.tabTitle)
       };
@@ -405,6 +415,7 @@
     });
 
     return {
+      documentTitle: aceNormalizeDocumentTitle(document.title || ""),
       tabId: aceNormalizeTabId(tabId),
       tabTitle: aceNormalizeTabTitle(tabTitle)
     };
@@ -412,6 +423,7 @@
 
   function aceSurfaceFromParts(parts = {}) {
     const documentId = String(parts.documentId || "").trim();
+    const documentTitle = aceNormalizeDocumentTitle(parts.documentTitle);
     const tabId = aceNormalizeTabId(parts.tabId);
     const tabTitle = aceNormalizeTabTitle(parts.tabTitle);
     const manuscriptSurfaceId = String(parts.manuscriptSurfaceId || "").trim()
@@ -422,6 +434,7 @@
 
     return {
       documentId,
+      documentTitle,
       tabId,
       tabTitle,
       manuscriptSurfaceId,
@@ -448,6 +461,7 @@
     return {
       projectId: String(details.projectId || surfaceOrParts.projectId || "").trim(),
       documentId: surface.documentId,
+      documentTitle: surface.documentTitle,
       tabId: surface.tabId,
       tabTitle: surface.tabTitle,
       manuscriptSurfaceId: surface.manuscriptSurfaceId,
@@ -540,6 +554,7 @@
   function aceSurfaceDiagnostic(surface) {
     return {
       documentId: surface?.documentId || "",
+      documentTitle: surface?.documentTitle || "",
       tabId: surface?.tabId || "",
       tabTitle: surface?.tabTitle || "",
       manuscriptSurfaceId: surface?.manuscriptSurfaceId || "",
@@ -550,6 +565,7 @@
   function aceSessionManuscriptSurface(session) {
     return aceSurfaceFromParts({
       documentId: session?.documentId || aceExtractDocumentId(),
+      documentTitle: session?.documentTitle,
       tabId: session?.tabId,
       tabTitle: session?.tabTitle,
       manuscriptSurfaceId: session?.manuscriptSurfaceId,
@@ -943,13 +959,15 @@
       const bindingEntry = Object.values(state.bindings || {}).find(function (binding) {
         return binding?.projectId === project.id;
       });
+      const bindingStatus = bindingEntry?.status || (bindingEntry ? "active" : "unbound");
+      const isStale = ACE_STALE_BINDING_STATUSES.has(bindingStatus);
       return {
         project: aceFakeDocsProjectSummary(project),
-        isBound: Boolean(bindingEntry),
-        bindingStatus: bindingEntry ? "active" : "unbound",
-        staleReason: "",
-        binding: bindingEntry || null,
-        deletedBinding: null
+        isBound: Boolean(bindingEntry && !isStale),
+        bindingStatus,
+        staleReason: bindingEntry?.staleReason || "",
+        binding: bindingEntry && !isStale ? bindingEntry : null,
+        deletedBinding: bindingEntry && isStale ? bindingEntry : null
       };
     });
   }
@@ -991,15 +1009,27 @@
     }
 
     if (metadata.wordCountMode !== "ok" || !Number.isFinite(Number(metadata.wordCount))) {
+      const unavailableStatus = metadata.wordCountMode === "deleted"
+        ? 404
+        : metadata.wordCountMode === "forbidden"
+          ? 403
+          : metadata.wordCountMode === "failure"
+            ? 503
+            : 422;
+      const unavailableError = metadata.wordCountMode === "deleted"
+        ? "E-GOOGLE-API-404: Requested entity was not found."
+        : metadata.wordCountMode === "forbidden"
+          ? "E-GOOGLE-API-403: The caller does not have permission."
+          : metadata.wordCountMode === "failure"
+            ? "E-FAKE-WORD-COUNT-FAILED: Fake word count read failed."
+            : "E-FAKE-WORD-COUNT-MISSING: Fake word count is unavailable.";
       return {
         ok: false,
-        status: metadata.wordCountMode === "failure" ? 503 : 422,
+        status: unavailableStatus,
         wordCount: null,
         apiWordCount: null,
         visibleWordCount: null,
-        error: metadata.wordCountMode === "failure"
-          ? "E-FAKE-WORD-COUNT-FAILED: Fake word count read failed."
-          : "E-FAKE-WORD-COUNT-MISSING: Fake word count is unavailable."
+        error: unavailableError
       };
     }
 
@@ -1080,11 +1110,12 @@
         const documentId = parsedUrl.searchParams.get("documentId") || "";
         const manuscriptSurfaceId = parsedUrl.searchParams.get("manuscriptSurfaceId") || aceCreateManuscriptSurfaceId(documentId, parsedUrl.searchParams.get("tabId"));
         const binding = state.bindings[manuscriptSurfaceId] || null;
+        const isStale = ACE_STALE_BINDING_STATUSES.has(binding?.status || "");
         const project = binding ? aceFakeDocsFindProject(state, binding.projectId) : null;
         return {
           documentId,
           manuscriptSurfaceId,
-          project: project ? aceFakeDocsProjectSummary(project) : null
+          project: project && !isStale ? aceFakeDocsProjectSummary(project) : null
         };
       }
 
@@ -1124,6 +1155,27 @@
         await aceSaveFakeDocsApiState(state);
         return { documentId: surface.documentId, manuscriptSurfaceId: surface.manuscriptSurfaceId, project: aceFakeDocsProjectSummary(project) };
       }
+
+      if (method === "DELETE") {
+        const payload = aceFakeDocsParseBody(options);
+        const surface = aceFakeDocsSurfaceFromPayload(payload);
+        delete state.bindings[surface.manuscriptSurfaceId];
+        await aceSaveFakeDocsApiState(state);
+        return { removed: true };
+      }
+    }
+
+    if (basePath === "/api/extension/document-binding/status" && method === "PATCH") {
+      const payload = aceFakeDocsParseBody(options);
+      const surface = aceFakeDocsSurfaceFromPayload(payload);
+      const binding = state.bindings[surface.manuscriptSurfaceId];
+      if (binding) {
+        binding.status = payload.status || "active";
+        binding.staleReason = payload.staleReason || "";
+        binding.updatedAt = new Date().toISOString();
+      }
+      await aceSaveFakeDocsApiState(state);
+      return { binding: binding || null };
     }
 
     if (method === "POST" && basePath === "/api/extension/sessions") {
@@ -1213,13 +1265,9 @@
           });
           return payload;
         } catch (directError) {
-          console.warn("[ACE] APP API AUTH FALLBACK", {
-            path,
-            bridgeStatus: Number(response.status) || 0,
-            action: "direct-fetch-failed",
-            bridgeError: response.error || "",
-            directError: directError?.message || String(directError)
-          });
+          console.warn(
+            `[ACE] APP API AUTH FALLBACK direct-fetch-failed path=${path} bridgeStatus=${Number(response.status) || 0} bridgeError=${aceShortDiagnostic(response.error || "", 120)} directError=${aceShortDiagnostic(directError?.message || String(directError), 120)}`
+          );
           throw directError;
         }
       }
@@ -1256,6 +1304,7 @@
       method: "PUT",
       body: JSON.stringify({
         documentId: surface.documentId,
+        documentTitle: surface.documentTitle,
         tabId: surface.tabId,
         tabTitle: surface.tabTitle,
         manuscriptSurfaceId: surface.manuscriptSurfaceId,
@@ -1348,6 +1397,7 @@
     return {
       ...record,
       documentId: record.documentId || surface.documentId,
+      documentTitle: record.documentTitle || surface.documentTitle,
       tabId: record.tabId || surface.tabId,
       tabTitle: record.tabTitle || surface.tabTitle,
       manuscriptSurfaceId: record.manuscriptSurfaceId || surface.manuscriptSurfaceId,
@@ -1389,6 +1439,10 @@
     }
 
     const bindings = await aceLocalDocumentBindings();
+    const existingBinding = aceFindSurfaceRecord(bindings, surface);
+    const documentTitle = surface.documentTitle || existingBinding?.documentTitle || "";
+    const tabTitle = surface.tabTitle || existingBinding?.tabTitle || "";
+    const manuscriptSurfaceLabel = surface.manuscriptSurfaceLabel || existingBinding?.manuscriptSurfaceLabel || "";
     const nextBindings = {};
     Object.entries(bindings).forEach(function ([key, binding]) {
       const existingProjectId = String(binding?.projectId || binding || "").trim();
@@ -1402,10 +1456,11 @@
         ...nextBindings,
         [surface.manuscriptSurfaceId]: {
           documentId: surface.documentId,
+          documentTitle,
           tabId: surface.tabId,
-          tabTitle: surface.tabTitle,
+          tabTitle,
           manuscriptSurfaceId: surface.manuscriptSurfaceId,
-          manuscriptSurfaceLabel: surface.manuscriptSurfaceLabel,
+          manuscriptSurfaceLabel,
           projectId: project.id,
           project,
           updatedAt: new Date().toISOString()
@@ -1452,7 +1507,11 @@
       await aceSaveLocalDocumentBinding(surface, serverBinding.project);
       delete aceAutoStartBindingMisses[surface.manuscriptSurfaceId || surface.documentId];
       return {
+        ...(localBinding || {}),
         ...surface,
+        documentTitle: surface.documentTitle || localBinding?.documentTitle || "",
+        tabTitle: surface.tabTitle || localBinding?.tabTitle || "",
+        manuscriptSurfaceLabel: surface.manuscriptSurfaceLabel || localBinding?.manuscriptSurfaceLabel || "",
         projectId: serverBinding.project.id,
         project: serverBinding.project
       };
@@ -1500,20 +1559,38 @@
 
   function aceProjectPickerStatusLabel(item) {
     const status = aceBindingStatus(item);
+    const binding = item?.binding || item?.documentBinding || item?.deletedBinding || item?.project?.deletedBinding || null;
+    const documentLabel = aceBindingDocumentLabel(binding);
+    const tabLabel = aceBindingTabLabel(binding);
+    const bindingTarget = documentLabel
+      ? `${documentLabel}${tabLabel ? ` · ${tabLabel}` : ""}`
+      : "";
     if (status === "stale_missing_doc") {
-      return "Bound · missing doc";
+      return bindingTarget ? `Missing doc · ${bindingTarget}` : "Bound · missing doc";
     }
     if (status === "stale_missing_tab") {
-      return "Bound · missing tab";
+      return bindingTarget ? `Missing tab · ${bindingTarget}` : "Bound · missing tab";
     }
     if (status === "stale_inaccessible") {
-      return "Bound · inaccessible";
+      return bindingTarget ? `Inaccessible · ${bindingTarget}` : "Bound · inaccessible";
     }
     if (item?.isBound) {
-      return "Bound";
+      return bindingTarget ? `Bound to ${bindingTarget}` : "Bound";
     }
     const project = item?.project || item;
     return project?.manuscriptType || project?.status || "Project";
+  }
+
+  function aceBindingDocumentLabel(binding) {
+    return aceNormalizeDocumentTitle(binding?.documentTitle)
+      || aceNormalizeDocumentTitle(binding?.documentName)
+      || "";
+  }
+
+  function aceBindingTabLabel(binding) {
+    return aceNormalizeTabTitle(binding?.tabTitle)
+      || aceNormalizeTabTitle(binding?.manuscriptSurfaceLabel)
+      || "";
   }
 
   function aceValidateBoundDocument(projectBinding, currentTabDocument = {}, apiResponse = null) {
@@ -1610,6 +1687,63 @@
     return { status: "", staleReason: error };
   }
 
+  function aceUnavailableBindingPromptMessage(bindingStatus) {
+    if (bindingStatus === "stale_inaccessible") {
+      return "Bound document inaccessible. Rebind required.";
+    }
+    if (bindingStatus === "stale_missing_tab") {
+      return "Bound document tab unavailable. Rebind required.";
+    }
+    return "Bound document unavailable. Rebind required.";
+  }
+
+  async function aceMarkBindingUnavailable(binding, validation, source = "binding-validation") {
+    if (!binding?.documentId || !binding?.manuscriptSurfaceId || validation?.status !== "deleted") {
+      return;
+    }
+    const bindingStatus = validation.bindingStatus || "stale_missing_doc";
+    const staleReason = validation.reason || bindingStatus;
+    await aceRemoveLocalDocumentBinding(binding);
+    console.info("[ACE] BINDING VALIDATION", {
+      projectId: binding.projectId || binding.project?.id || "",
+      previousBoundDocumentId: binding.documentId,
+      currentTabDocumentId: aceCurrentManuscriptSurface().documentId,
+      validationStatus: validation.status,
+      deletionReason: staleReason,
+      localStateUpdated: true,
+      baselineScanRan: false,
+      source
+    });
+    try {
+      await aceUpdateBindingStatus(binding, bindingStatus, staleReason);
+      console.info("[ACE] BINDING VALIDATION SERVER", {
+        projectId: binding.projectId || binding.project?.id || "",
+        previousBoundDocumentId: binding.documentId,
+        validationStatus: validation.status,
+        serverUpdateSucceeded: true,
+        source
+      });
+    } catch (error) {
+      console.warn("[ACE] Failed to update binding status", error);
+    }
+  }
+
+  async function aceValidateCurrentBindingAvailability(binding, surface, source = "prompt") {
+    if (!binding?.projectId || !binding?.documentId || !binding?.manuscriptSurfaceId) {
+      return {
+        status: "unbound",
+        bindingStatus: "unbound",
+        reason: "no binding"
+      };
+    }
+    const response = await aceGoogleDocWordCount(binding.documentId, false, binding);
+    const validation = aceValidateBoundDocument({ binding }, surface, response);
+    if (validation.status === "deleted") {
+      await aceMarkBindingUnavailable(binding, validation, source);
+    }
+    return validation;
+  }
+
   async function aceValidateProjectBindingItem(item) {
     const deletedBinding = aceDeletedBindingForProjectItem(item);
     if (!item?.isBound) {
@@ -1625,6 +1759,24 @@
     }
     const binding = aceProjectPickerBinding(item);
     if (!binding?.documentId || !binding?.manuscriptSurfaceId) {
+      if (item?.isBound || aceBindingStatus(item) === "active") {
+        const project = item?.project || item || {};
+        const staleReason = "Binding metadata is missing document identity.";
+        return {
+          ...item,
+          isBound: false,
+          bindingStatus: "stale_missing_doc",
+          staleReason,
+          binding: null,
+          deletedBinding: {
+            ...(item?.binding || item?.documentBinding || {}),
+            projectId: project.id || item?.projectId || "",
+            status: "stale_missing_doc",
+            staleReason,
+            detectedAt: new Date().toISOString()
+          }
+        };
+      }
       return item;
     }
 
@@ -1668,25 +1820,24 @@
       deletedBinding: nextDeletedBinding
     };
     if (isDeleted) {
-      await aceRemoveLocalDocumentBinding(binding);
-    }
-    console.info("[ACE] BINDING VALIDATION", {
-      projectId: item?.project?.id || item?.id || "",
-      previousBoundDocumentId: binding.documentId,
-      currentTabDocumentId: aceCurrentManuscriptSurface().documentId,
-      validationStatus: validation.status,
-      deletionReason: validation.reason,
-      localStateUpdated: isDeleted,
-      baselineScanRan: false
-    });
-    if (bindingStatus !== previousStatus || staleReason !== String(item.staleReason || item.binding?.staleReason || "")) {
+      await aceMarkBindingUnavailable(
+        {
+          ...binding,
+          projectId: item?.project?.id || item?.id || binding.projectId || "",
+          project: item?.project || binding.project || null
+        },
+        validation,
+        "project-picker"
+      );
+    } else if (bindingStatus !== previousStatus || staleReason !== String(item.staleReason || item.binding?.staleReason || "")) {
       try {
         await aceUpdateBindingStatus(binding, bindingStatus, staleReason);
         console.info("[ACE] BINDING VALIDATION SERVER", {
           projectId: item?.project?.id || item?.id || "",
           previousBoundDocumentId: binding.documentId,
           validationStatus: validation.status,
-          serverUpdateSucceeded: true
+          serverUpdateSucceeded: true,
+          source: "project-picker"
         });
       } catch (error) {
         console.warn("[ACE] Failed to update binding status", error);
@@ -3157,8 +3308,9 @@
     if (hasStableVisible) {
       const selectedEndWordCount = Math.max(0, visibleWordCount);
       const netWordsChanged = aceCalculateNetWordDelta(baselineWordCount, selectedEndWordCount);
+      const selectedVisibleZero = selectedEndWordCount === 0;
       const selectedVisibleZeroAfterPositiveStart = selectedEndWordCount === 0 && baselineWordCount > 0;
-      const decisionApiResponse = selectedVisibleZeroAfterPositiveStart && !apiResponse
+      const decisionApiResponse = selectedVisibleZero && !apiResponse
         ? await aceWithTimeout(apiPromise, apiTimeoutMs, aceApiTimeoutResponse(apiTimeoutMs))
         : apiResponse;
       const immediateApiWordCount = Number(decisionApiResponse?.apiWordCount ?? decisionApiResponse?.wordCount);
@@ -3166,10 +3318,11 @@
       const immediateApiMismatch = immediateApiAvailable
         && Math.max(0, immediateApiWordCount) !== selectedEndWordCount;
       const immediateApiEndWordCount = immediateApiAvailable ? Math.max(0, immediateApiWordCount) : null;
-      const visibleZeroApiPositiveMismatch = selectedVisibleZeroAfterPositiveStart
+      const visibleZeroApiPositiveMismatch = selectedVisibleZero
         && Number.isFinite(immediateApiEndWordCount)
         && immediateApiEndWordCount > 0;
       const visibleZeroWithoutActivity = selectedVisibleZeroAfterPositiveStart && !hadDocumentActivity;
+      const visibleZeroApiPositiveAfterEmptyStart = visibleZeroApiPositiveMismatch && baselineWordCount === 0;
 
       if (visibleZeroWithoutActivity && immediateApiEndWordCount === baselineWordCount) {
         const apiNetWordsChanged = aceCalculateNetWordDelta(baselineWordCount, immediateApiEndWordCount);
@@ -3192,6 +3345,50 @@
           apiPendingAtDecision: false,
           finalSelectedCountSource: "google-docs-api",
           trustedReason: "visible zero conflicted with unchanged API count and no document activity",
+          action: "sync-session"
+        });
+        return {
+          ...(decisionApiResponse || {}),
+          ok: true,
+          status: decisionApiResponse?.status || 200,
+          method: "google-docs-api",
+          wordCount: immediateApiEndWordCount,
+          apiWordCount: immediateApiEndWordCount,
+          visibleWordCount: selectedEndWordCount,
+          visibleCountDiagnostic: stableVisible,
+          wordsAdded: 0,
+          wordsRemoved: 0,
+          netWordsChanged: apiNetWordsChanged,
+          wordCounts: null,
+          endWordCounts: null,
+          wordCountTokenizerVersion: decisionApiResponse?.wordCountTokenizerVersion || "",
+          wordCountDiagnostic,
+          error: "",
+          timing
+        };
+      }
+
+      if (visibleZeroApiPositiveAfterEmptyStart) {
+        const apiNetWordsChanged = aceCalculateNetWordDelta(baselineWordCount, immediateApiEndWordCount);
+        const wordCountDiagnostic = aceGoogleDocNetDiagnostic({
+          code: "W-VISIBLE-ZERO-API-POSITIVE",
+          attempt: 1,
+          startWordCount: baselineWordCount,
+          apiEndWordCount: immediateApiEndWordCount,
+          visibleEndWordCount: selectedEndWordCount,
+          netWordsChanged: apiNetWordsChanged,
+          revisionChanged: false,
+          startRevisionId,
+          endRevisionId: decisionApiResponse?.revisionId || "",
+          startSource: "stored-start-count",
+          endSource: "google-docs-api",
+          details: `stable visible zero rejected because the session API returned a positive end count after an empty start. ${stableVisible.diagnostic || ""}`
+        });
+        timing.compareElapsedMs += aceTimingElapsedMs(compareStartedAt);
+        aceCompleteWordCountTiming(timing, {
+          apiPendingAtDecision: false,
+          finalSelectedCountSource: "google-docs-api",
+          trustedReason: "visible zero rejected because session API count was positive after empty start",
           action: "sync-session"
         });
         return {
@@ -3560,6 +3757,46 @@
     ) {
       const selectedApiCount = Math.max(0, apiWordCount);
       const apiNetWordsChanged = aceCalculateNetWordDelta(baselineWordCount, selectedApiCount);
+      const apiChangedFromBaseline = apiNetWordsChanged !== 0;
+      const isCatchUpCheck = options.trigger !== "bind-baseline";
+      if (isCatchUpCheck && apiChangedFromBaseline) {
+        timing.compareElapsedMs += aceTimingElapsedMs(compareStartedAt);
+        aceCompleteWordCountTiming(timing, {
+          apiPendingAtDecision: false,
+          finalSelectedCountSource: "google-docs-api-untrusted",
+          trustedReason: "false visible zero with changed API count is diagnostic only",
+          action: "diagnostic-only"
+        });
+        return {
+          ...boundedApiResponse,
+          ok: false,
+          skipCatchUp: true,
+          status: boundedApiResponse.status || 200,
+          method: "google-docs-api",
+          wordCount: null,
+          apiWordCount: selectedApiCount,
+          visibleWordCount: selectedWordCount,
+          visibleCountDiagnostic: stableVisible,
+          visibleCandidates: aceCatchUpVisibleCandidateSummary(stableVisible),
+          netWordsChanged: 0,
+          currentCountSource: "none",
+          currentCountTrusted: false,
+          apiVisibleMismatch: true,
+          wordCountDiagnostic: aceCatchUpSnapshotDiagnostic({
+            code: "W-VISIBLE-ZERO-API-POSITIVE-DIAGNOSTIC",
+            baselineWordCount,
+            apiWordCount: selectedApiCount,
+            visibleWordCount: selectedWordCount,
+            netWordsChanged: apiNetWordsChanged,
+            apiResponse: boundedApiResponse,
+            stableVisible,
+            endSource: "google-docs-api",
+            details: "stable visible zero conflicted with a changed positive API count; catch-up suppressed because the visible counter could not confirm the change"
+          }),
+          error: "W-VISIBLE-ZERO-API-POSITIVE-DIAGNOSTIC: Visible word count could not confirm the changed API count.",
+          timing
+        };
+      }
       timing.compareElapsedMs += aceTimingElapsedMs(compareStartedAt);
       aceCompleteWordCountTiming(timing, {
         apiPendingAtDecision: false,
@@ -3976,14 +4213,18 @@
     const binding = aceCurrentBinding;
     const project = binding?.project || null;
     const projectTitle = project?.bookTitle || "Project";
-    const tabLabel = surface?.manuscriptSurfaceLabel || surface?.tabTitle || "Current manuscript";
+    const boundDocumentLabel = aceBindingDocumentLabel(binding) || aceBindingDocumentLabel(surface) || "Unknown document";
+    const boundTabLabel = aceBindingTabLabel(binding) || aceBindingTabLabel(surface) || "Current manuscript";
+    const currentDocumentLabel = aceBindingDocumentLabel(surface) || "Current document";
+    const currentTabLabel = aceBindingTabLabel(surface) || "Current manuscript";
     const errorCopy = acePromptError
       ? `<div class="ace-sync-copy ace-sync-copy--pending">${aceEscapeHtml(aceShortDiagnostic(acePromptError))}</div>`
       : "";
     const body = binding?.projectId
       ? `
         <div class="ace-field-readout"><span>Project</span><strong>${aceEscapeHtml(projectTitle)}</strong></div>
-        <div class="ace-field-readout"><span>Current tab</span><strong>${aceEscapeHtml(tabLabel)}</strong></div>
+        <div class="ace-field-readout"><span>Document</span><strong>${aceEscapeHtml(boundDocumentLabel)}</strong></div>
+        <div class="ace-field-readout"><span>Tab</span><strong>${aceEscapeHtml(boundTabLabel)}</strong></div>
         ${errorCopy}
         <div class="ace-actions">
           <button class="ace-button ace-button--primary" type="button" data-ace-action="start-writing">Start writing</button>
@@ -3995,7 +4236,8 @@
       `
       : `
         <div class="ace-field-readout"><span>Project</span><strong>Not bound</strong></div>
-        <div class="ace-field-readout"><span>Current tab</span><strong>${aceEscapeHtml(tabLabel)}</strong></div>
+        <div class="ace-field-readout"><span>Document</span><strong>${aceEscapeHtml(currentDocumentLabel)}</strong></div>
+        <div class="ace-field-readout"><span>Tab</span><strong>${aceEscapeHtml(currentTabLabel)}</strong></div>
         ${errorCopy}
         <div class="ace-actions">
           <button class="ace-button ace-button--primary" type="button" data-ace-action="bind-project">Bind project</button>
@@ -5172,6 +5414,15 @@
     }
     try {
       aceCurrentBinding = await aceGetBoundProjectForDocument(surface);
+      if (aceCurrentBinding?.projectId) {
+        const validation = await aceValidateCurrentBindingAvailability(aceCurrentBinding, surface, "prompt");
+        if (validation.status === "deleted") {
+          aceCurrentBinding = null;
+          aceSelectedProject = null;
+          acePromptError = aceUnavailableBindingPromptMessage(validation.bindingStatus);
+          return null;
+        }
+      }
       aceSelectedProject = aceCurrentBinding?.project || null;
     } catch (error) {
       acePromptError = error.message || "Project lookup failed.";
@@ -5761,6 +6012,7 @@
       missingBaseline: "D-CATCHUP-NO-BASELINE",
       "missing-baseline": "D-CATCHUP-NO-BASELINE",
       "no-binding": "D-CATCHUP-NO-BINDING",
+      "binding-unavailable": "D-CATCHUP-NO-BINDING",
       "active-session": "D-CATCHUP-SUPPRESSED-ACTIVE-SESSION",
       "uncertain-surface": "D-CATCHUP-SURFACE-MISMATCH",
       "baseline-surface-mismatch": "D-CATCHUP-SURFACE-MISMATCH",
@@ -5915,6 +6167,27 @@
       verifyZeroWithApi: true,
       apiSurfaceTrusted: true
     });
+    const bindingValidation = aceValidateBoundDocument({ binding }, surface, currentSnapshot);
+    if (bindingValidation.status === "deleted") {
+      await aceMarkBindingUnavailable(binding, bindingValidation, "catch-up");
+      const trace = aceCatchUpDecisionTrace({
+        trigger,
+        surface,
+        baseline,
+        baselineKey: baselineInfo.key,
+        baselineIsLegacy: baselineInfo.isLegacy,
+        currentSnapshot,
+        reason: "binding-unavailable",
+        action: "skip-catch-up"
+      });
+      aceLogCatchUpDecision(trace);
+      return {
+        candidate: null,
+        error: aceUnavailableBindingPromptMessage(bindingValidation.bindingStatus),
+        reason: "binding-unavailable",
+        trace
+      };
+    }
     const currentWordCount = currentSnapshot?.ok && Number.isFinite(Number(currentSnapshot.wordCount))
       ? Math.max(0, Number(currentSnapshot.wordCount))
       : null;
@@ -6027,7 +6300,9 @@
     }
 
     aceState = "prompt";
-    acePromptError = catchUpResult.reason === "zero-net"
+    acePromptError = catchUpResult.error
+      ? catchUpResult.error
+      : catchUpResult.reason === "zero-net"
       ? "Document changes are already synced."
       : "Could not verify document changes right now.";
     aceRenderPrompt();

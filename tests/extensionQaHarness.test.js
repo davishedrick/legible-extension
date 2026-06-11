@@ -127,6 +127,41 @@ test("project fetch recovers when runtime bridge auth misses but direct app sess
   assert.equal(fetchCalls[0].options.credentials, "include");
 });
 
+test("app auth fallback warning is readable when direct fetch fails", async () => {
+  const warnings = [];
+  const { exports, context } = loadContent({
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-api-fetch" && message.path === "/api/extension/projects") {
+        callback({
+          ok: false,
+          status: 401,
+          payload: { error: "Authentication required." },
+          error: "Authentication required."
+        });
+        return;
+      }
+      callback({ ok: false, error: "Unexpected message." });
+    },
+    fetch: async () => ({
+      ok: false,
+      status: 401,
+      text: async () => "Authentication required."
+    })
+  });
+  context.console.warn = (...args) => warnings.push(args);
+
+  await assert.rejects(
+    () => exports.aceGetExtensionProjects(),
+    /Scriptor API request failed/
+  );
+
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].length, 1);
+  assert.match(warnings[0][0], /APP API AUTH FALLBACK direct-fetch-failed/);
+  assert.match(warnings[0][0], /path=\/api\/extension\/projects/);
+  assert.doesNotMatch(warnings[0][0], /\[object Object\]/);
+});
+
 test("background can focus owning Chrome tab and request session end", async () => {
   const tabMessages = [];
   const tab = { id: 101, windowId: 7, active: false };
@@ -230,6 +265,40 @@ test("server binding reconciliation replaces stale local project metadata", asyn
   assert.equal(storage.aceDocumentBindings[surface.manuscriptSurfaceId].projectId, "project-server");
 });
 
+test("website-created and extension-created projects use the same local binding schema", async () => {
+  const { exports, storage } = loadContent();
+  const websiteSurface = surfaceFactory({ documentId: "doc-web", tabId: "tab-a", tabTitle: "Website Tab" });
+  const extensionSurface = surfaceFactory({ documentId: "doc-extension", tabId: "tab-b", tabTitle: "Extension Tab" });
+  const websiteProject = projectFactory({ id: "project-web", bookTitle: "Website Project" });
+  const extensionProject = projectFactory({ id: "project-extension", bookTitle: "Extension Project" });
+
+  await exports.aceSaveLocalDocumentBinding(websiteSurface, websiteProject);
+  await exports.aceSaveLocalDocumentBinding(extensionSurface, extensionProject);
+
+  const websiteBinding = storage.aceDocumentBindings[websiteSurface.manuscriptSurfaceId];
+  const extensionBinding = storage.aceDocumentBindings[extensionSurface.manuscriptSurfaceId];
+  const schemaKeys = [
+    "documentId",
+    "documentTitle",
+    "manuscriptSurfaceId",
+    "manuscriptSurfaceLabel",
+    "project",
+    "projectId",
+    "tabId",
+    "tabTitle",
+    "updatedAt"
+  ];
+
+  assert.deepEqual(Object.keys(websiteBinding).sort(), schemaKeys);
+  assert.deepEqual(Object.keys(extensionBinding).sort(), schemaKeys);
+  assert.equal(websiteBinding.projectId, websiteProject.id);
+  assert.equal(extensionBinding.projectId, extensionProject.id);
+  assert.equal(websiteBinding.documentId, "doc-web");
+  assert.equal(extensionBinding.documentId, "doc-extension");
+  assert.equal(websiteBinding.documentTitle, "Test Google Doc");
+  assert.equal(extensionBinding.documentTitle, "Test Google Doc");
+});
+
 test("project picker marks deleted document binding as unbound with deleted marker", async () => {
   const surface = surfaceFactory({ documentId: "deleted-doc", tabId: "tab-a", tabTitle: "Deleted Tab" });
   const project = projectFactory({ id: "project-deleted", bookTitle: "Deleted Project" });
@@ -260,8 +329,34 @@ test("project picker marks deleted document binding as unbound with deleted mark
   assert.equal(projects[0].isBound, false);
   assert.equal(projects[0].binding, null);
   assert.equal(projects[0].deletedBinding.documentId, "deleted-doc");
-  assert.match(exports.aceProjectPickerStatusLabel(projects[0]), /missing doc/);
+  assert.match(exports.aceProjectPickerStatusLabel(projects[0]), /Missing doc/);
   assert.equal(routeCalls[0].options.method, "PATCH");
+});
+
+test("project picker treats bound row without document identity as rebind required", async () => {
+  const project = projectFactory({ id: "project-missing-metadata", bookTitle: "Missing Metadata" });
+  const { exports } = loadContent();
+
+  const projects = await exports.aceReconcileProjectPickerBindings([
+    {
+      project,
+      isBound: true,
+      bindingStatus: "active",
+      binding: {
+        projectId: project.id,
+        documentTitle: "Deleted Draft",
+        tabTitle: "Chapter 1"
+      },
+      deletedBinding: null
+    }
+  ]);
+
+  assert.equal(projects[0].isBound, false);
+  assert.equal(projects[0].bindingStatus, "stale_missing_doc");
+  assert.equal(projects[0].binding, null);
+  assert.equal(projects[0].deletedBinding.status, "stale_missing_doc");
+  assert.match(exports.aceProjectPickerStatusLabel(projects[0]), /Missing doc/);
+  assert.match(exports.aceProjectPickerStatusLabel(projects[0]), /Deleted Draft/);
 });
 
 test("project picker does not mark binding stale on validation network failure", async () => {
@@ -313,7 +408,7 @@ test("project picker classifies missing tab as stale_missing_tab", async () => {
   ]);
 
   assert.equal(projects[0].bindingStatus, "stale_missing_tab");
-  assert.match(exports.aceProjectPickerStatusLabel(projects[0]), /missing tab/);
+  assert.match(exports.aceProjectPickerStatusLabel(projects[0]), /Missing tab/);
 });
 
 test("project picker classifies forbidden doc as stale_inaccessible", async () => {
@@ -341,7 +436,138 @@ test("project picker classifies forbidden doc as stale_inaccessible", async () =
   ]);
 
   assert.equal(projects[0].bindingStatus, "stale_inaccessible");
-  assert.match(exports.aceProjectPickerStatusLabel(projects[0]), /inaccessible/);
+  assert.match(exports.aceProjectPickerStatusLabel(projects[0]), /Inaccessible/);
+});
+
+test("prompt lookup invalidates deleted bound document before showing bound controls", async () => {
+  const surface = surfaceFactory({ documentId: "deleted-doc", tabId: "tab-a", tabTitle: "Deleted Tab" });
+  const project = projectFactory({ id: "project-deleted", bookTitle: "Deleted Project" });
+  const routeCalls = [];
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceDocumentBindings: {
+        [surface.manuscriptSurfaceId]: bindingFactory({ ...surface, project })
+      }
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({
+          ok: false,
+          status: 404,
+          wordCount: null,
+          error: "E-GOOGLE-API-404: Requested entity was not found."
+        });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        routeCalls.push(message);
+        if (String(message.path).startsWith("/api/extension/document-binding?")) {
+          callback({ ok: true, payload: { project } });
+          return;
+        }
+        callback({ ok: true, payload: { binding: { status: "stale_missing_doc" } } });
+      }
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await exports.aceShowControls();
+
+  const state = exports.aceTestState();
+  const patchCall = routeCalls.find((call) => call.options?.method === "PATCH");
+  const patchPayload = JSON.parse(patchCall.options.body);
+  assert.equal(state.state, "prompt");
+  assert.equal(state.currentBinding, null);
+  assert.equal(storage.aceDocumentBindings[surface.manuscriptSurfaceId], undefined);
+  assert.equal(patchPayload.status, "stale_missing_doc");
+  assert.match(state.widgetHtml, /Bound document unavailable\. Rebind required\./);
+  assert.match(state.widgetHtml, /Not bound/);
+  assert.doesNotMatch(state.widgetHtml, /Start writing/);
+  assert.doesNotMatch(state.widgetHtml, /Sync document changes/);
+});
+
+test("prompt lookup marks forbidden bound document unavailable instead of staying valid", async () => {
+  const surface = surfaceFactory({ documentId: "forbidden-doc", tabId: "tab-a", tabTitle: "Forbidden Tab" });
+  const project = projectFactory({ id: "project-forbidden", bookTitle: "Forbidden Project" });
+  const routeCalls = [];
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceDocumentBindings: {
+        [surface.manuscriptSurfaceId]: bindingFactory({ ...surface, project })
+      }
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({
+          ok: false,
+          status: 403,
+          wordCount: null,
+          error: "E-GOOGLE-API-403: The caller does not have permission."
+        });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        routeCalls.push(message);
+        if (String(message.path).startsWith("/api/extension/document-binding?")) {
+          callback({ ok: true, payload: { project } });
+          return;
+        }
+        callback({ ok: true, payload: { binding: { status: "stale_inaccessible" } } });
+      }
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await exports.aceShowControls();
+
+  const state = exports.aceTestState();
+  const patchCall = routeCalls.find((call) => call.options?.method === "PATCH");
+  const patchPayload = JSON.parse(patchCall.options.body);
+  assert.equal(state.currentBinding, null);
+  assert.equal(storage.aceDocumentBindings[surface.manuscriptSurfaceId], undefined);
+  assert.equal(patchPayload.status, "stale_inaccessible");
+  assert.match(state.widgetHtml, /Bound document inaccessible\. Rebind required\./);
+  assert.doesNotMatch(state.widgetHtml, /Start writing/);
+});
+
+test("existing valid bound project remains available after prompt validation", async () => {
+  const surface = surfaceFactory({ documentId: "doc-live", tabId: "tab-a", tabTitle: "Live Tab" });
+  const project = projectFactory({ id: "project-live", bookTitle: "Live Project" });
+  const { exports, storage } = loadContent({
+    topFrame: true,
+    visibleWordCount: 1200,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceDocumentBindings: {
+        [surface.manuscriptSurfaceId]: bindingFactory({ ...surface, project })
+      }
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({ ok: true, status: 200, wordCount: 1200, revisionId: "live" });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        callback({ ok: true, payload: { project } });
+      }
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  await exports.aceShowControls();
+
+  const state = exports.aceTestState();
+  assert.equal(state.currentBinding.projectId, project.id);
+  assert.equal(storage.aceDocumentBindings[surface.manuscriptSurfaceId].projectId, project.id);
+  assert.match(state.widgetHtml, /<span>Project<\/span><strong>Live Project<\/strong>/);
+  assert.match(state.widgetHtml, /<span>Document<\/span><strong>Test Google Doc<\/strong>/);
+  assert.match(state.widgetHtml, /<span>Tab<\/span><strong>Live Tab<\/strong>/);
+  assert.match(state.widgetHtml, /Start writing/);
+  assert.match(state.widgetHtml, /Sync document changes/);
 });
 
 test("clearing stale binding removes backend and local binding without touching history", async () => {
