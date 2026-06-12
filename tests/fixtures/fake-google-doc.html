@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fake Google Doc</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f7f8fb;
+      color: #202124;
+    }
+
+    main {
+      max-width: 860px;
+      margin: 48px auto;
+      padding: 24px;
+      background: white;
+      border: 1px solid #dadce0;
+    }
+
+    [data-testid="editable-document-body"] {
+      min-height: 260px;
+      padding: 18px;
+      border: 1px solid #dadce0;
+      outline: none;
+      line-height: 1.6;
+    }
+
+    .fake-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 16px 0;
+    }
+
+    .fake-word-count {
+      position: fixed;
+      left: 20px;
+      bottom: 20px;
+      padding: 10px 14px;
+      background: #fff;
+      border: 1px solid #dadce0;
+      box-shadow: 0 2px 8px rgba(60, 64, 67, 0.18);
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <main
+    data-testid="fake-doc"
+    data-scriptor-fake-doc="true"
+    data-document-id="doc-a"
+    data-tab-id="tab-a"
+    data-tab-title="Tab A"
+    data-document-title="Document A"
+    data-word-count="10305"
+    data-project-id="fake-project-a"
+    data-project-title="Fake Project A"
+    data-project-estimate="10000"
+  >
+    <h1 data-testid="fake-title">Document A</h1>
+    <div class="fake-toolbar" aria-label="Fake document controls">
+      <button type="button" data-testid="set-count-10305">Set 10,305</button>
+      <button type="button" data-testid="set-count-10800">Set 10,800</button>
+      <button type="button" data-testid="set-count-10805">Set 10,805</button>
+      <button type="button" data-testid="set-count-60500">Set 60,500</button>
+      <button type="button" data-testid="set-count-60000">Set 60,000</button>
+      <button type="button" data-testid="set-count-500">Set 500</button>
+      <button type="button" data-testid="switch-to-doc-a">Switch to Document A</button>
+      <button type="button" data-testid="switch-to-doc-b">Switch to Document B</button>
+    </div>
+    <section
+      data-testid="editable-document-body"
+      contenteditable="true"
+      role="textbox"
+      aria-label="Fake document body"
+    >Fake manuscript content.</section>
+  </main>
+  <div class="fake-word-count" data-testid="word-count">10,305 words</div>
+
+  <script>
+    const fakeDoc = document.querySelector('[data-testid="fake-doc"]');
+    const title = document.querySelector('[data-testid="fake-title"]');
+    const wordCount = document.querySelector('[data-testid="word-count"]');
+    const editable = document.querySelector('[data-testid="editable-document-body"]');
+
+    function formatNumber(value) {
+      return Number(value || 0).toLocaleString("en-US");
+    }
+
+    function setWordCount(value, dispatchInput = true) {
+      const count = Math.max(0, Math.round(Number(value) || 0));
+      fakeDoc.setAttribute("data-word-count-mode", "ok");
+      fakeDoc.setAttribute("data-word-count", String(count));
+      wordCount.textContent = `${formatNumber(count)} words`;
+      editable.textContent = `Fake manuscript at ${formatNumber(count)} words.`;
+      if (dispatchInput) {
+        editable.dispatchEvent(new InputEvent("beforeinput", { bubbles: true, inputType: "insertText", data: "x" }));
+        editable.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: "x" }));
+      }
+    }
+
+    function setVisibleWordCount(value) {
+      const count = Math.max(0, Math.round(Number(value) || 0));
+      wordCount.textContent = `${formatNumber(count)} words`;
+    }
+
+    function setWordCountUnavailable(mode = "missing") {
+      fakeDoc.setAttribute("data-word-count-mode", mode);
+      fakeDoc.removeAttribute("data-word-count");
+      wordCount.textContent = "Word count unavailable";
+    }
+
+    function setDocument(documentId, documentTitle, count) {
+      fakeDoc.setAttribute("data-document-id", documentId);
+      fakeDoc.setAttribute("data-document-title", documentTitle);
+      fakeDoc.setAttribute("data-tab-title", documentTitle === "Document B" ? "Tab B" : "Tab A");
+      title.textContent = documentTitle;
+      document.title = documentTitle;
+      setWordCount(count);
+    }
+
+    function applyUrlDefaults() {
+      const params = new URLSearchParams(window.location.search);
+      const pathMatch = window.location.pathname.match(/\/document\/d\/([^/]+)/);
+      const documentId = params.get("docId") || (pathMatch ? decodeURIComponent(pathMatch[1]) : "doc-a");
+      const documentTitle = params.get("title") || (documentId === "doc-b" ? "Document B" : "Document A");
+      const words = params.get("words") || fakeDoc.getAttribute("data-word-count") || "10305";
+      fakeDoc.setAttribute("data-document-id", documentId);
+      fakeDoc.setAttribute("data-document-title", documentTitle);
+      fakeDoc.setAttribute("data-tab-title", params.get("tabTitle") || "Tab A");
+      if (params.has("projectStartingWordCount")) {
+        fakeDoc.setAttribute("data-project-starting-word-count", params.get("projectStartingWordCount"));
+      }
+      if (params.has("projectBaselineEstablished")) {
+        fakeDoc.setAttribute("data-project-baseline-established", params.get("projectBaselineEstablished"));
+      }
+      if (params.has("projectStartingWordCountSource")) {
+        fakeDoc.setAttribute("data-project-starting-word-count-source", params.get("projectStartingWordCountSource"));
+      }
+      title.textContent = documentTitle;
+      document.title = documentTitle;
+      setWordCount(words, false);
+    }
+
+    document.querySelector('[data-testid="set-count-10305"]').addEventListener("click", () => setWordCount(10305));
+    document.querySelector('[data-testid="set-count-10800"]').addEventListener("click", () => setWordCount(10800));
+    document.querySelector('[data-testid="set-count-10805"]').addEventListener("click", () => setWordCount(10805));
+    document.querySelector('[data-testid="set-count-60500"]').addEventListener("click", () => setWordCount(60500));
+    document.querySelector('[data-testid="set-count-60000"]').addEventListener("click", () => setWordCount(60000));
+    document.querySelector('[data-testid="set-count-500"]').addEventListener("click", () => setWordCount(500));
+    document.querySelector('[data-testid="switch-to-doc-a"]').addEventListener("click", () => setDocument("doc-a", "Document A", 60500));
+    document.querySelector('[data-testid="switch-to-doc-b"]').addEventListener("click", () => setDocument("doc-b", "Document B", 500));
+
+    window.__fakeDocsSetWordCount = setWordCount;
+    window.__fakeDocsSetVisibleWordCount = setVisibleWordCount;
+    window.__fakeDocsSetWordCountUnavailable = setWordCountUnavailable;
+    window.__fakeDocsSetDocument = setDocument;
+
+    applyUrlDefaults();
+  </script>
+</body>
+</html>

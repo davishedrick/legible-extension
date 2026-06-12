@@ -22,6 +22,7 @@ function surfaceFactory(overrides = {}) {
   const manuscriptSurfaceId = overrides.manuscriptSurfaceId || `${document.documentId}:${tabId}`;
   return {
     documentId: document.documentId,
+    documentTitle: document.title || "",
     tabId,
     tabTitle: tab.tabTitle || "",
     manuscriptSurfaceId,

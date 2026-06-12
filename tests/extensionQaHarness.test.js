@@ -789,6 +789,103 @@ test("manual session start shows positive catch-up before starting", async () =>
   assert.match(state.widgetHtml, /Detected change: .*>\+495 words</);
 });
 
+test("opening controls after zero bind and off-session writing shows catch-up", async () => {
+  const surface = surfaceFactory({ documentId: "doc-zero-bind-catchup", tabId: "tab-a", tabTitle: "Tab A" });
+  const project = projectFactory({ id: "project-zero-bind-catchup", bookTitle: "Zero Bind Catchup" });
+  const { exports } = loadContent({
+    topFrame: true,
+    visibleWordCount: 1000,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceDocumentBindings: {
+        [surface.manuscriptSurfaceId]: bindingFactory({ ...surface, project })
+      },
+      aceDocumentBaselines: {
+        [surface.manuscriptSurfaceId]: baselineFactory(0, { ...surface, project })
+      }
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({ ok: true, status: 200, wordCount: 1000, revisionId: "after-off-session-writing" });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        callback({ ok: true, payload: { project } });
+      }
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  exports.aceSetTestState({
+    state: "idle",
+    currentSurface: surface,
+    currentBinding: null,
+    selectedProject: null,
+    activeSession: null,
+    completedSession: null,
+    catchUpCandidate: null
+  });
+
+  await exports.aceShowControls();
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "catch-up");
+  assert.equal(state.activeSession, null);
+  assert.equal(state.catchUpCandidate.startDocumentWordCount, 0);
+  assert.equal(state.catchUpCandidate.endDocumentWordCount, 1000);
+  assert.equal(state.catchUpCandidate.netWordsChanged, 1000);
+  assert.match(state.widgetHtml, /Net: \+1000 words since last session\./);
+});
+
+test("starting after zero bind and off-session writing shows catch-up before session", async () => {
+  const surface = surfaceFactory({ documentId: "doc-zero-bind-start", tabId: "tab-a", tabTitle: "Tab A" });
+  const project = projectFactory({ id: "project-zero-bind-start", bookTitle: "Zero Bind Start" });
+  const { exports } = loadContent({
+    topFrame: true,
+    visibleWordCount: 1000,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceDocumentBindings: {
+        [surface.manuscriptSurfaceId]: bindingFactory({ ...surface, project })
+      },
+      aceDocumentBaselines: {
+        [surface.manuscriptSurfaceId]: baselineFactory(0, { ...surface, project })
+      }
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({ ok: true, status: 200, wordCount: 1000, revisionId: "after-off-session-writing" });
+        return;
+      }
+      if (message.aceType === "ace-google-doc-start-snapshot") {
+        callback({ ok: true, status: 200, wordCount: 1000, revisionId: "start-after-catchup" });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        callback({ ok: true, payload: { project } });
+      }
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  exports.aceSetTestState({
+    state: "prompt",
+    currentSurface: surface,
+    currentBinding: bindingFactory({ ...surface, project }),
+    selectedProject: project,
+    activeSession: null,
+    completedSession: null,
+    catchUpCandidate: null
+  });
+
+  await exports.aceStartSession("writing");
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "catch-up");
+  assert.equal(state.activeSession, null);
+  assert.equal(state.catchUpCandidate.startDocumentWordCount, 0);
+  assert.equal(state.catchUpCandidate.endDocumentWordCount, 1000);
+  assert.equal(state.catchUpCandidate.netWordsChanged, 1000);
+});
+
 test("page load does not show catch-up for existing bound surface", async () => {
   const surface = surfaceFactory({ documentId: "doc-page-load", tabId: "tab-a", tabTitle: "Tab A" });
   const project = projectFactory({ id: "project-page-load", bookTitle: "Page Load Project" });

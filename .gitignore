@@ -1,0 +1,13 @@
+node_modules/
+test-results/
+playwright-report/
+google-docs-smoke-results/
+google-docs-smoke-report/
+playwright/.auth/
+tests/e2e-google-docs/.auth/
+*.storage-state.json
+storageState*.json
+.env.google-docs-smoke
+google-docs-smoke.env
+.pytest_cache/
+__pycache__/

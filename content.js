@@ -137,6 +137,7 @@
   const ACE_TYPING_CATCH_UP_SUPPRESSION_MS = 15000;
   const ACE_CATCH_UP_BOUNDARY_TRIGGERS = new Set([
     "bind",
+    "show-controls",
     "pre-session",
     "manual-sync"
   ]);
@@ -908,6 +909,11 @@
     const projectId = element?.getAttribute("data-project-id") || "fake-project-a";
     const title = element?.getAttribute("data-project-title") || "Fake Project A";
     const currentWordCount = aceFakeDocsNumber(element?.getAttribute("data-project-estimate"), 10000);
+    const startingWordCountAttr = element?.getAttribute("data-project-starting-word-count");
+    const startingWordCount = startingWordCountAttr === null || startingWordCountAttr === undefined || startingWordCountAttr === ""
+      ? null
+      : aceFakeDocsNumber(startingWordCountAttr, 0);
+    const baselineEstablishedAttr = String(element?.getAttribute("data-project-baseline-established") || "").toLowerCase();
     return {
       id: projectId,
       status: "active",
@@ -915,9 +921,9 @@
         bookTitle: title,
         manuscriptType: "Novel",
         currentWordCount,
-        startingWordCount: null,
-        baselineEstablished: false,
-        startingWordCountSource: "provisional",
+        startingWordCount,
+        baselineEstablished: ["true", "1", "yes"].includes(baselineEstablishedAttr),
+        startingWordCountSource: element?.getAttribute("data-project-starting-word-count-source") || "provisional",
         startingWordCountEstablishedAt: ""
       },
       sessions: [],
@@ -1078,7 +1084,17 @@
       return;
     }
     const verifiedWordCount = aceFakeDocsNumber(wordCount, 0);
-    if (!projectBundle.baselineEstablished && project.sessions.length === 0) {
+    const existingStartingWordCount = projectBundle.startingWordCount === null || projectBundle.startingWordCount === undefined
+      ? null
+      : aceFakeDocsNumber(projectBundle.startingWordCount, 0);
+    const existingSource = String(projectBundle.startingWordCountSource || "");
+    const hasSessions = Array.isArray(project.sessions) && project.sessions.length > 0;
+    const provisionalZeroBaseline = !hasSessions
+      && projectBundle.baselineEstablished
+      && existingStartingWordCount === 0
+      && verifiedWordCount > 0
+      && ["", "provisional", "migration_bound_no_sessions"].includes(existingSource);
+    if ((!projectBundle.baselineEstablished || provisionalZeroBaseline) && !hasSessions) {
       projectBundle.startingWordCount = verifiedWordCount;
       projectBundle.startingWordCountSource = source;
       projectBundle.startingWordCountEstablishedAt = new Date().toISOString();
@@ -5469,6 +5485,20 @@
       aceRenderPrompt();
       return;
     }
+    const startingSurfaceId = aceCurrentManuscriptSurface().manuscriptSurfaceId;
+    const catchUpResult = await aceBuildCatchUpCandidate(aceExtractDocumentId(), "show-controls");
+    if (aceCurrentManuscriptSurface().manuscriptSurfaceId !== startingSurfaceId) {
+      return;
+    }
+    if (catchUpResult.candidate) {
+      aceCatchUpCandidate = catchUpResult.candidate;
+      aceSyncStatus = "";
+      aceSyncMessage = "";
+      aceState = "catch-up";
+      aceRenderCatchUpPrompt();
+      return;
+    }
+    acePromptError = catchUpResult.error || "";
     aceState = "prompt";
     aceRenderPrompt();
   }

@@ -1,6 +1,10 @@
 {
   "scripts": {
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js",
+    "test:e2e": "playwright test",
+    "test:e2e:google-docs": "playwright test --config=playwright.google-docs.config.js"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "@playwright/test": "^1.53.0"
+  }
 }
