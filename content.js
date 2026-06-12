@@ -5810,6 +5810,13 @@
       validationStatus: "deleted",
       deletionReason: pending.deletedBinding?.staleReason || pending.deletedBinding?.status || ""
     });
+    if (pending.deletedBinding?.documentId) {
+      try {
+        await aceDeleteBinding(pending.deletedBinding);
+      } catch (error) {
+        console.warn("[ACE] Failed to delete old binding before rebind", error);
+      }
+    }
     await aceBindCurrentSurfaceToProject(pending.project.id, { skipInitialCatchUp: true });
   }
 
