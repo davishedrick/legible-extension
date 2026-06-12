@@ -886,6 +886,57 @@ test("starting after zero bind and off-session writing shows catch-up before ses
   assert.equal(state.catchUpCandidate.netWordsChanged, 1000);
 });
 
+test("starting after zero bind trusts positive API catch-up when visible count is still stale zero", async () => {
+  const surface = surfaceFactory({ documentId: "doc-zero-bind-stale-visible", tabId: "tab-a", tabTitle: "Tab A" });
+  const project = projectFactory({ id: "project-zero-bind-stale-visible", bookTitle: "Zero Bind Stale Visible" });
+  const { exports } = loadContent({
+    topFrame: true,
+    visibleWordCount: 0,
+    location: locationForSurface(surface),
+    initialStorage: {
+      aceDocumentBindings: {
+        [surface.manuscriptSurfaceId]: bindingFactory({ ...surface, project })
+      },
+      aceDocumentBaselines: {
+        [surface.manuscriptSurfaceId]: baselineFactory(0, { ...surface, project })
+      }
+    },
+    sendMessage(message, callback) {
+      if (message.aceType === "ace-google-doc-word-count") {
+        callback({ ok: true, status: 200, wordCount: 500, revisionId: "api-after-off-session-writing" });
+        return;
+      }
+      if (message.aceType === "ace-google-doc-start-snapshot") {
+        callback({ ok: true, status: 200, wordCount: 500, revisionId: "start-after-catchup" });
+        return;
+      }
+      if (message.aceType === "ace-api-fetch") {
+        callback({ ok: true, payload: { project } });
+      }
+    }
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  exports.aceSetTestState({
+    state: "prompt",
+    currentSurface: surface,
+    currentBinding: bindingFactory({ ...surface, project }),
+    selectedProject: project,
+    activeSession: null,
+    completedSession: null,
+    catchUpCandidate: null
+  });
+
+  await exports.aceStartSession("writing");
+
+  const state = exports.aceTestState();
+  assert.equal(state.state, "catch-up");
+  assert.equal(state.activeSession, null);
+  assert.equal(state.catchUpCandidate.startDocumentWordCount, 0);
+  assert.equal(state.catchUpCandidate.endDocumentWordCount, 500);
+  assert.equal(state.catchUpCandidate.netWordsChanged, 500);
+  assert.equal(state.catchUpCandidate.currentSnapshot.currentCountSource, "google-docs-api");
+});
+
 test("page load does not show catch-up for existing bound surface", async () => {
   const surface = surfaceFactory({ documentId: "doc-page-load", tabId: "tab-a", tabTitle: "Tab A" });
   const project = projectFactory({ id: "project-page-load", bookTitle: "Page Load Project" });

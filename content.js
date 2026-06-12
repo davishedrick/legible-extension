@@ -3775,7 +3775,10 @@
       const apiNetWordsChanged = aceCalculateNetWordDelta(baselineWordCount, selectedApiCount);
       const apiChangedFromBaseline = apiNetWordsChanged !== 0;
       const isCatchUpCheck = options.trigger !== "bind-baseline";
-      if (isCatchUpCheck && apiChangedFromBaseline) {
+      const canTrustPositiveApiFromZeroBaseline = baselineWordCount === 0
+        && selectedApiCount > 0
+        && aceCatchUpTriggerCanPrompt(options.trigger);
+      if (isCatchUpCheck && apiChangedFromBaseline && !canTrustPositiveApiFromZeroBaseline) {
         timing.compareElapsedMs += aceTimingElapsedMs(compareStartedAt);
         aceCompleteWordCountTiming(timing, {
           apiPendingAtDecision: false,
@@ -3817,7 +3820,9 @@
       aceCompleteWordCountTiming(timing, {
         apiPendingAtDecision: false,
         finalSelectedCountSource: "google-docs-api",
-        trustedReason: "visible zero rejected because verified API count was positive",
+        trustedReason: canTrustPositiveApiFromZeroBaseline
+          ? "verified positive API growth from zero baseline at explicit catch-up boundary"
+          : "visible zero rejected because verified API count was positive",
         action: options.successAction || (apiNetWordsChanged === 0 ? "no-catch-up" : "show-catch-up")
       });
       return {
@@ -3843,7 +3848,9 @@
           apiResponse: boundedApiResponse,
           stableVisible,
           endSource: "google-docs-api",
-          details: "stable visible zero rejected because verified API count was positive"
+          details: canTrustPositiveApiFromZeroBaseline
+            ? "stable visible zero was stale after a verified zero baseline; explicit catch-up boundary trusted the positive API count"
+            : "stable visible zero rejected because verified API count was positive"
         }),
         error: "",
         timing
